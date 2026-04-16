@@ -2,7 +2,7 @@
 
 A production-ready, embeddable RAG (Retrieval-Augmented Generation) chatbot that answers questions from PDF documents. Built for ConveGenius.AI to handle HR policy queries in Hindi, Hinglish, and English.
 
-Live demo: [hr-support-bot.netlify.app](https://hr-support-bot.netlify.app)
+Live demo: [https://cg-hr-bot.vercel.app/](https://cg-hr-bot.vercel.app/)
 
 ## What It Does
 
