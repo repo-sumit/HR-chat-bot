@@ -20,7 +20,7 @@ load_dotenv()
 import pymupdf  # PyMuPDF
 from google import genai
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-004")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 OUTPUT_PATH = os.getenv("EMBEDDINGS_PATH", "data/embeddings.npz")
 API_KEY = os.environ["GEMINI_API_KEY"]
 
