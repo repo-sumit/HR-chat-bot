@@ -30,6 +30,16 @@ _metadata: np.ndarray | None = None
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Fallback model chain: if the primary model is rate-limited, try the next one
+FALLBACK_MODELS = [
+    GEMINI_MODEL,
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+]
+# Deduplicate while preserving order
+FALLBACK_MODELS = list(dict.fromkeys(FALLBACK_MODELS))
+
 SYSTEM_PROMPT = """\
 You are a helpful support assistant. You answer questions ONLY based on the provided context from the document.
 
@@ -150,27 +160,39 @@ async def generate_response(
     chunks: list[dict],
     history: list[dict] | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream tokens from Gemini for the given query + retrieved chunks, with retry on 429."""
+    """Stream tokens from Gemini, cycling through fallback models on 429."""
     contents = _build_prompt(query, chunks, history)
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=TEMPERATURE,
     )
-    for attempt in range(3):
+    last_error = None
+    for model_name in FALLBACK_MODELS:
         try:
+            log.info("Trying model: %s", model_name)
             stream = client.models.generate_content_stream(
-                model=f"models/{GEMINI_MODEL}",
+                model=f"models/{model_name}",
                 contents=contents,
                 config=config,
             )
             for response_chunk in stream:
                 if response_chunk.text:
                     yield response_chunk.text
-            return  # success, exit retry loop
+            return  # success
         except Exception as e:
-            if "429" in str(e) and attempt < 2:
-                wait = (attempt + 1) * 10
-                log.warning("Generation rate-limited, retrying in %ds...", wait)
-                await asyncio.sleep(wait)
-            else:
-                raise
+            last_error = e
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                log.warning("Model %s rate-limited, trying next fallback...", model_name)
+                continue
+            raise
+    # All models exhausted — wait and retry the primary once more
+    log.warning("All models rate-limited, waiting 40s before final retry...")
+    await asyncio.sleep(40)
+    stream = client.models.generate_content_stream(
+        model=f"models/{FALLBACK_MODELS[0]}",
+        contents=contents,
+        config=config,
+    )
+    for response_chunk in stream:
+        if response_chunk.text:
+            yield response_chunk.text
