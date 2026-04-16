@@ -94,6 +94,34 @@ def _cleanup_rate_store():
         del _rate_store[ip]
 
 
+# ── Friendly error messages ──────────────────────────────────────────
+
+import re
+
+def _friendly_error(exc: Exception) -> str:
+    msg = str(exc)
+    # Rate limit / quota exceeded
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        # Try to extract retry delay
+        match = re.search(r'retry in (\d+)', msg, re.IGNORECASE)
+        if match:
+            secs = int(match.group(1))
+            mins = secs // 60
+            remaining = secs % 60
+            if mins > 0:
+                return f"Bot is busy due to high usage. Please try again in {mins}m {remaining}s."
+            return f"Bot is busy due to high usage. Please try again in {secs} seconds."
+        return "Bot is busy due to high usage. Please try again in 1-2 minutes."
+    # Invalid API key
+    if "API_KEY_INVALID" in msg or "API key" in msg:
+        return "Service is temporarily unavailable. Please try again later."
+    # Model overloaded
+    if "503" in msg or "UNAVAILABLE" in msg:
+        return "Service is under heavy load. Please try again in a few minutes."
+    # Generic
+    return "Something went wrong. Please try again in a moment."
+
+
 # ── Startup ──────────────────────────────────────────────────────────
 
 SELF_PING_URL = os.getenv("RENDER_EXTERNAL_URL")  # auto-set by Render
@@ -172,7 +200,7 @@ async def chat(req: ChatRequest, request: Request):
         chunks = rag.retrieve(query_emb)
     except Exception as exc:
         log.exception("Retrieval failed")
-        return JSONResponse(status_code=500, content={"error": f"Retrieval error: {exc}"})
+        return JSONResponse(status_code=500, content={"error": _friendly_error(exc)})
 
     sources = [{"page": c["page"], "score": round(c["score"], 3)} for c in chunks]
     await log_chat(ip, query, sources)
@@ -187,7 +215,8 @@ async def chat(req: ChatRequest, request: Request):
             yield f"data: {payload}\n\n"
         except Exception as exc:
             log.exception("Generation failed")
-            err = json.dumps({"token": f"\n\n[Error: {exc}]", "done": True, "sources": []})
+            msg = _friendly_error(exc)
+            err = json.dumps({"token": "", "done": True, "sources": [], "error": msg})
             yield f"data: {err}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

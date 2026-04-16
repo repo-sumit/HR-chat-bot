@@ -164,6 +164,12 @@
               if (line.startsWith("data: ")) {
                 try {
                   var d = JSON.parse(line.slice(6));
+                  if (d.error) {
+                    removeEl(typing); typing = null;
+                    errorMsg(d.error);
+                    finish();
+                    return;
+                  }
                   if (d.token) {
                     if (!botDiv) { removeEl(typing); typing = null; botDiv = addMsg("", "bot"); }
                     fullText += d.token;
@@ -185,11 +191,11 @@
               }
             }
             read();
-          }).catch(function (err) { errorMsg(err.message); finish(); });
+          }).catch(function (err) { removeEl(typing); errorMsg(friendlyNetworkError(err)); finish(); });
         }
         read();
       })
-      .catch(function (err) { removeEl(typing); errorMsg(err.message); finish(); });
+      .catch(function (err) { removeEl(typing); errorMsg(friendlyNetworkError(err)); finish(); });
 
     function finish() {
       if (typing) removeEl(typing);
@@ -250,6 +256,15 @@
   function errorMsg(msg) {
     var div = addMsg("Sorry, something went wrong: " + msg, "bot");
     div.style.color = "#ef4444";
+  }
+
+  function friendlyNetworkError(err) {
+    var msg = (err && err.message) ? err.message.toLowerCase() : "";
+    if (msg.includes("failed to fetch") || msg.includes("network") || msg.includes("load failed"))
+      return "Cannot reach the server. It may be starting up — please try again in 30 seconds.";
+    if (msg.includes("timeout"))
+      return "Request timed out. Please try again.";
+    return err.message || "Something went wrong. Please try again.";
   }
 
   function esc(s) { var d = document.createElement("div"); d.textContent = s; return d.innerHTML; }
