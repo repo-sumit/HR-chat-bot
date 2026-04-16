@@ -155,41 +155,60 @@
 
   /* ── Voice input (Web Speech API) ─────────────────────────────── */
   var recognition = null;
+  var manualStop = false;
   if (SpeechRecognition) {
     recognition = new SpeechRecognition();
-    recognition.continuous = false;
+    recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = ""; // auto-detect (works for Hindi, English, Hinglish)
+    recognition.lang = "hi-IN"; // Hindi primary - also picks up English and Hinglish
 
     recognition.onstart = function () {
       isRecording = true;
+      manualStop = false;
       micBtn.classList.add("psb-recording");
-      input.placeholder = "Listening...";
+      input.placeholder = "Listening... tap mic to stop";
     };
 
     recognition.onresult = function (e) {
-      var transcript = "";
+      var final = "";
+      var interim = "";
       for (var i = 0; i < e.results.length; i++) {
-        transcript += e.results[i][0].transcript;
+        if (e.results[i].isFinal) {
+          final += e.results[i][0].transcript;
+        } else {
+          interim += e.results[i][0].transcript;
+        }
       }
-      input.value = transcript;
+      input.value = final + interim;
       input.style.height = "auto";
       input.style.height = Math.min(input.scrollHeight, 80) + "px";
     };
 
     recognition.onend = function () {
+      // If user didn't manually stop and we have no text, restart (keeps listening)
+      if (!manualStop && isRecording && !input.value.trim()) {
+        try { recognition.start(); } catch (e) {}
+        return;
+      }
       isRecording = false;
       micBtn.classList.remove("psb-recording");
       input.placeholder = "Type or speak\u2026";
-      input.focus();
+      if (input.value.trim()) input.focus();
     };
 
     recognition.onerror = function (e) {
+      if (e.error === "no-speech") {
+        // No speech detected - restart if still recording
+        if (isRecording && !manualStop) {
+          try { recognition.start(); } catch (ex) {}
+        }
+        return;
+      }
       isRecording = false;
       micBtn.classList.remove("psb-recording");
       input.placeholder = "Type or speak\u2026";
       if (e.error === "not-allowed") {
-        errorMsg("Microphone access denied. Please allow microphone permission.");
+        errorMsg("Microphone access denied. Please allow mic permission in browser settings.");
       }
     };
   }
@@ -197,10 +216,12 @@
   micBtn.onclick = function () {
     if (!recognition || isBusy) return;
     if (isRecording) {
+      manualStop = true;
       recognition.stop();
     } else {
       input.value = "";
-      recognition.start();
+      manualStop = false;
+      try { recognition.start(); } catch (e) {}
     }
   };
 
@@ -261,12 +282,6 @@
                     msgArea.scrollTop = msgArea.scrollHeight;
                   }
                   if (d.done) {
-                    if (d.sources && d.sources.length) {
-                      var srcDiv = document.createElement("div");
-                      srcDiv.className = "psb-sources";
-                      srcDiv.textContent = "Sources: " + d.sources.map(function (s) { return "Page " + s.page; }).join(", ");
-                      if (botDiv) botDiv.appendChild(srcDiv);
-                    }
                     history.push({ role: "assistant", content: fullText });
                     finish();
                     return;
