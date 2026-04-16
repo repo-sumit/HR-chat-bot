@@ -60,6 +60,25 @@ def _cleanup_rate_store():
 
 # ── Startup ──────────────────────────────────────────────────────────
 
+SELF_PING_URL = os.getenv("RENDER_EXTERNAL_URL")  # auto-set by Render
+SELF_PING_INTERVAL = 600  # every 10 minutes
+
+
+async def _keep_alive():
+    """Ping ourselves periodically to prevent Render free-tier sleep."""
+    if not SELF_PING_URL:
+        return
+    log.info("Keep-alive started: pinging %s every %ds", SELF_PING_URL, SELF_PING_INTERVAL)
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(SELF_PING_INTERVAL)
+            try:
+                resp = await client.get(f"{SELF_PING_URL}/", timeout=10)
+                log.debug("Keep-alive ping: %s", resp.status_code)
+            except Exception as exc:
+                log.warning("Keep-alive ping failed: %s", exc)
+
+
 @app.on_event("startup")
 async def startup():
     try:
@@ -70,6 +89,8 @@ async def startup():
     ok = await rag.verify_api_key()
     if not ok:
         log.error("GEMINI_API_KEY is invalid or Gemini API unreachable")
+    # Start keep-alive background task
+    asyncio.create_task(_keep_alive())
 
 
 # ── Routes ───────────────────────────────────────────────────────────
