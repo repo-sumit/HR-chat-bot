@@ -42,10 +42,16 @@
     .psb-dot:nth-child(2){animation-delay:.15s}
     .psb-dot:nth-child(3){animation-delay:.3s}
     @keyframes psb-bounce{to{transform:translateY(-6px);background:${TEAL}}}
-    .psb-input-bar{display:flex;padding:12px 14px;border-top:1px solid #ececf4;gap:8px;flex-shrink:0;background:#fff}
+    .psb-input-bar{display:flex;padding:12px 14px;border-top:1px solid #ececf4;gap:6px;flex-shrink:0;background:#fff;align-items:flex-end}
     .psb-input{flex:1;border:1px solid #dddde8;border-radius:12px;padding:9px 14px;font-size:14px;outline:none;resize:none;font-family:'Inter',system-ui,sans-serif;max-height:80px;background:#f7f8fc;transition:border-color .2s,background .2s}
     .psb-input:focus{border-color:${TEAL};background:#fff}
-    .psb-send{background:${ACCENT};color:#fff;border:none;border-radius:12px;padding:9px 16px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;letter-spacing:0.2px;transition:background .15s,transform .1s}
+    .psb-mic{background:none;border:1px solid #dddde8;border-radius:12px;width:38px;height:38px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .2s}
+    .psb-mic svg{width:18px;height:18px;fill:#666}
+    .psb-mic:hover{border-color:${TEAL};background:rgba(91,197,200,.08)}
+    .psb-mic.psb-recording{border-color:#ef4444;background:rgba(239,68,68,.08);animation:psb-mic-pulse 1s ease-in-out infinite}
+    .psb-mic.psb-recording svg{fill:#ef4444}
+    @keyframes psb-mic-pulse{0%,100%{box-shadow:none}50%{box-shadow:0 0 0 4px rgba(239,68,68,.15)}}
+    .psb-send{background:${ACCENT};color:#fff;border:none;border-radius:12px;padding:9px 16px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;letter-spacing:0.2px;transition:background .15s,transform .1s;height:38px}
     .psb-send:hover{background:#3d3ba0}
     .psb-send:active{transform:scale(.97)}
     .psb-send:disabled{opacity:.45;cursor:default;transform:none}
@@ -77,7 +83,7 @@
   win.innerHTML =
     '<div class="psb-header"><span>' + esc(BOT) + '</span><button class="psb-close">\u00d7</button></div>' +
     '<div class="psb-messages"></div>' +
-    '<div class="psb-input-bar"><textarea class="psb-input" placeholder="Type a message\u2026" rows="1"></textarea><button class="psb-send">Send</button></div>' +
+    '<div class="psb-input-bar"><textarea class="psb-input" placeholder="Type or speak\u2026" rows="1"></textarea><button class="psb-mic" aria-label="Voice input"><svg viewBox="0 0 24 24"><path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/></svg></button><button class="psb-send">Ask</button></div>' +
     '<div class="psb-footer">Powered by ' + esc(BOT) + '</div>';
 
   wrap.appendChild(win);
@@ -87,10 +93,16 @@
   var msgArea = win.querySelector(".psb-messages");
   var input = win.querySelector(".psb-input");
   var sendBtn = win.querySelector(".psb-send");
+  var micBtn = win.querySelector(".psb-mic");
   var closeBtn = win.querySelector(".psb-close");
   var isOpen = false;
   var isBusy = false;
+  var isRecording = false;
   var history = [];
+
+  // Hide mic if browser doesn't support speech recognition
+  var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition) { micBtn.style.display = "none"; }
 
   // Show greeting
   addMsg(GREETING, "bot");
@@ -140,6 +152,57 @@
     sendBtn.disabled = true;
     streamResponse(text);
   }
+
+  /* ── Voice input (Web Speech API) ─────────────────────────────── */
+  var recognition = null;
+  if (SpeechRecognition) {
+    recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.lang = ""; // auto-detect (works for Hindi, English, Hinglish)
+
+    recognition.onstart = function () {
+      isRecording = true;
+      micBtn.classList.add("psb-recording");
+      input.placeholder = "Listening...";
+    };
+
+    recognition.onresult = function (e) {
+      var transcript = "";
+      for (var i = 0; i < e.results.length; i++) {
+        transcript += e.results[i][0].transcript;
+      }
+      input.value = transcript;
+      input.style.height = "auto";
+      input.style.height = Math.min(input.scrollHeight, 80) + "px";
+    };
+
+    recognition.onend = function () {
+      isRecording = false;
+      micBtn.classList.remove("psb-recording");
+      input.placeholder = "Type or speak\u2026";
+      input.focus();
+    };
+
+    recognition.onerror = function (e) {
+      isRecording = false;
+      micBtn.classList.remove("psb-recording");
+      input.placeholder = "Type or speak\u2026";
+      if (e.error === "not-allowed") {
+        errorMsg("Microphone access denied. Please allow microphone permission.");
+      }
+    };
+  }
+
+  micBtn.onclick = function () {
+    if (!recognition || isBusy) return;
+    if (isRecording) {
+      recognition.stop();
+    } else {
+      input.value = "";
+      recognition.start();
+    }
+  };
 
   /* ── SSE streaming with auto-retry ──────────────────────────────── */
   var MAX_RETRIES = 3;
