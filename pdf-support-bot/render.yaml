@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: pdf-support-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false

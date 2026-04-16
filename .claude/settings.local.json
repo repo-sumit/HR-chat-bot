@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c ' *)",
+      "Bash(GEMINI_API_KEY=test_dummy_key timeout 10 uvicorn app.main:app --port 8765)",
+      "Bash(curl -s http://localhost:8765/)",
+      "Bash(curl -s http://localhost:8765/widget.js)",
+      "Bash(curl -s -X POST http://localhost:8765/api/chat -H \"Content-Type: application/json\" -d '{\"message\":\"hello\"}')",
+      "Bash(python -m uvicorn --version)"
+    ]
+  }
+}
