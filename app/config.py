@@ -3,8 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY: str = os.environ["GEMINI_API_KEY"]
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 EMBEDDINGS_PATH: str = os.getenv("EMBEDDINGS_PATH", "data/embeddings.npz")
 MAX_CONTEXT_CHUNKS: int = int(os.getenv("MAX_CONTEXT_CHUNKS", "4"))

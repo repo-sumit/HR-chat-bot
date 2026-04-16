@@ -1,22 +1,21 @@
-"""Core RAG logic: load embeddings, retrieve chunks, stream Gemini responses."""
+"""Core RAG logic: load embeddings, retrieve chunks, stream responses via Groq."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import time
 from typing import AsyncGenerator
 
 import numpy as np
 from google import genai
-from google.genai import types
 
 from app.config import (
     EMBEDDING_MODEL,
     EMBEDDINGS_PATH,
     GEMINI_API_KEY,
-    GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
     MAX_CONTEXT_CHUNKS,
     TEMPERATURE,
 )
@@ -28,17 +27,19 @@ _chunks: np.ndarray | None = None
 _embeddings: np.ndarray | None = None
 _metadata: np.ndarray | None = None
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Gemini client — used only for embeddings
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
-# Fallback model chain: if the primary model is rate-limited, try the next one
-FALLBACK_MODELS = [
-    GEMINI_MODEL,
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-]
-# Deduplicate while preserving order
-FALLBACK_MODELS = list(dict.fromkeys(FALLBACK_MODELS))
+# Groq client — used for generation
+_groq_client = None
+
+def _get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        from groq import Groq
+        _groq_client = Groq(api_key=GROQ_API_KEY)
+    return _groq_client
+
 
 SYSTEM_PROMPT = """\
 You are a helpful support assistant. You answer questions ONLY based on the provided context from the document.
@@ -72,12 +73,14 @@ def load_embeddings(path: str = EMBEDDINGS_PATH) -> int:
 
 
 async def verify_api_key() -> bool:
-    """Quick test that the Gemini key works."""
+    """Quick test that the Groq key works."""
     try:
-        client.models.get(model=f"models/{GEMINI_MODEL}")
+        client = _get_groq_client()
+        client.models.list()
+        log.info("Groq API key verified, using model: %s", GROQ_MODEL)
         return True
     except Exception as exc:
-        log.error("Gemini API key verification failed: %s", exc)
+        log.error("Groq API key verification failed: %s", exc)
         return False
 
 
@@ -87,7 +90,6 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Cosine similarity between vector *a* (1-D) and matrix *b* (2-D)."""
     norm_a = np.linalg.norm(a)
     norms_b = np.linalg.norm(b, axis=1)
-    # guard against zero-division
     denom = norm_a * norms_b
     denom[denom == 0] = 1e-10
     return (b @ a) / denom
@@ -111,10 +113,10 @@ def retrieve(query_embedding: np.ndarray, top_k: int = MAX_CONTEXT_CHUNKS) -> li
 
 
 async def embed_query(text: str) -> np.ndarray:
-    """Embed a single query string using Gemini embedding model, with retry on 429."""
+    """Embed a single query string using Gemini embedding model."""
     for attempt in range(3):
         try:
-            resp = client.models.embed_content(
+            resp = gemini_client.models.embed_content(
                 model=f"models/{EMBEDDING_MODEL}",
                 contents=text,
             )
@@ -128,31 +130,25 @@ async def embed_query(text: str) -> np.ndarray:
                 raise
 
 
-# ── generation (streaming) ───────────────────────────────────────────
+# ── generation (streaming via Groq) ─────────────────────────────────
 
-def _build_prompt(query: str, chunks: list[dict], history: list[dict] | None = None) -> list[types.Content]:
-    """Build the Gemini conversation contents list."""
-    # Context block
+def _build_messages(query: str, chunks: list[dict], history: list[dict] | None = None) -> list[dict]:
+    """Build the message list for Groq chat completion."""
     context_parts = []
     for i, c in enumerate(chunks, 1):
         context_parts.append(f"[Chunk {i} | Page {c['page']}]\n{c['text']}")
     context_block = "\n\n---\n\n".join(context_parts)
 
-    contents: list[types.Content] = []
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Inject previous conversation turns if provided
     if history:
-        for turn in history[-6:]:  # keep last 6 turns to stay within limits
-            role = "user" if turn["role"] == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part.from_text(text=turn["content"])]))
+        for turn in history[-6:]:
+            role = "user" if turn["role"] == "user" else "assistant"
+            messages.append({"role": role, "content": turn["content"]})
 
-    # Current user message with context
-    user_text = (
-        f"CONTEXT FROM DOCUMENT:\n{context_block}\n\n"
-        f"USER QUESTION:\n{query}"
-    )
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
-    return contents
+    user_text = f"CONTEXT FROM DOCUMENT:\n{context_block}\n\nUSER QUESTION:\n{query}"
+    messages.append({"role": "user", "content": user_text})
+    return messages
 
 
 async def generate_response(
@@ -160,39 +156,17 @@ async def generate_response(
     chunks: list[dict],
     history: list[dict] | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream tokens from Gemini, cycling through fallback models on 429."""
-    contents = _build_prompt(query, chunks, history)
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+    """Stream tokens from Groq."""
+    messages = _build_messages(query, chunks, history)
+    client = _get_groq_client()
+
+    stream = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
         temperature=TEMPERATURE,
+        stream=True,
     )
-    last_error = None
-    for model_name in FALLBACK_MODELS:
-        try:
-            log.info("Trying model: %s", model_name)
-            stream = client.models.generate_content_stream(
-                model=f"models/{model_name}",
-                contents=contents,
-                config=config,
-            )
-            for response_chunk in stream:
-                if response_chunk.text:
-                    yield response_chunk.text
-            return  # success
-        except Exception as e:
-            last_error = e
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                log.warning("Model %s rate-limited, trying next fallback...", model_name)
-                continue
-            raise
-    # All models exhausted — wait and retry the primary once more
-    log.warning("All models rate-limited, waiting 40s before final retry...")
-    await asyncio.sleep(40)
-    stream = client.models.generate_content_stream(
-        model=f"models/{FALLBACK_MODELS[0]}",
-        contents=contents,
-        config=config,
-    )
-    for response_chunk in stream:
-        if response_chunk.text:
-            yield response_chunk.text
+    for chunk in stream:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            yield delta.content
