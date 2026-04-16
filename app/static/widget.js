@@ -26,9 +26,16 @@
     .psb-close{background:rgba(255,255,255,.15);border:none;color:#fff;cursor:pointer;font-size:18px;padding:2px 8px;line-height:1;border-radius:8px;opacity:.9;transition:background .15s}
     .psb-close:hover{background:rgba(255,255,255,.25);opacity:1}
     .psb-messages{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px;background:#f7f8fc}
-    .psb-msg{max-width:85%;padding:10px 14px;border-radius:14px;word-wrap:break-word;white-space:pre-wrap;font-size:13.5px}
+    .psb-msg{max-width:85%;padding:10px 14px;border-radius:14px;word-wrap:break-word;font-size:13.5px}
     .psb-msg a{color:inherit;text-decoration:underline}
+    .psb-user{white-space:pre-wrap}
     .psb-bot{background:#fff;color:#1a1a1a;align-self:flex-start;border-bottom-left-radius:4px;box-shadow:0 1px 4px rgba(45,43,127,.06);border:1px solid #ececf4}
+    .psb-bot strong{color:${ACCENT};font-weight:600}
+    .psb-bot ul,.psb-bot ol{margin:6px 0;padding-left:18px}
+    .psb-bot li{margin:3px 0}
+    .psb-bot p{margin:4px 0}
+    .psb-bot h1,.psb-bot h2,.psb-bot h3{color:${ACCENT};font-weight:600;margin:8px 0 4px}
+    .psb-bot h1{font-size:16px} .psb-bot h2{font-size:15px} .psb-bot h3{font-size:14px}
     .psb-user{background:${ACCENT};color:#fff;align-self:flex-end;border-bottom-right-radius:4px;box-shadow:0 2px 8px rgba(45,43,127,.15)}
     .psb-typing{align-self:flex-start;display:flex;gap:5px;padding:10px 14px;background:#fff;border-radius:14px;border-bottom-left-radius:4px;border:1px solid #ececf4}
     .psb-dot{width:8px;height:8px;background:#c5c5d6;border-radius:50%;animation:psb-bounce .6s infinite alternate}
@@ -160,7 +167,7 @@
                   if (d.token) {
                     if (!botDiv) { removeEl(typing); typing = null; botDiv = addMsg("", "bot"); }
                     fullText += d.token;
-                    botDiv.textContent = fullText;
+                    botDiv.innerHTML = renderMarkdown(fullText);
                     msgArea.scrollTop = msgArea.scrollHeight;
                   }
                   if (d.done) {
@@ -192,11 +199,38 @@
     }
   }
 
+  /* ── Markdown renderer (lightweight) ────────────────────────────── */
+  function renderMarkdown(text) {
+    var html = esc(text);
+    // Headers: ###, ##, #
+    html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+    html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+    html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+    // Bold: **text**
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Italic: *text*
+    html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+    // Unordered list items: * item or - item
+    html = html.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
+    // Wrap consecutive <li> in <ul>
+    html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+    // Line breaks for remaining lines (but not inside block elements)
+    html = html.replace(/\n/g, '<br>');
+    // Clean up <br> after block elements
+    html = html.replace(/<\/(h[1-3]|ul|li)><br>/g, '</$1>');
+    html = html.replace(/<br><(h[1-3]|ul)/g, '<$1');
+    return html;
+  }
+
   /* ── Helpers ───────────────────────────────────────────────────── */
   function addMsg(text, role) {
     var div = document.createElement("div");
     div.className = "psb-msg " + (role === "bot" ? "psb-bot" : "psb-user");
-    div.textContent = text;
+    if (role === "bot") {
+      div.innerHTML = renderMarkdown(text);
+    } else {
+      div.textContent = text;
+    }
     msgArea.appendChild(div);
     msgArea.scrollTop = msgArea.scrollHeight;
     return div;
