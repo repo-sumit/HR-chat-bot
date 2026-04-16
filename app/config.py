@@ -19,3 +19,4 @@ ALLOWED_ORIGINS: list[str] = [
     for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")
     if o.strip()
 ]
+ADMIN_SECRET: str = os.getenv("ADMIN_SECRET", "changeme123")

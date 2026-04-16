@@ -16,8 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from datetime import datetime, timezone
+
 from app import rag
-from app.config import ALLOWED_ORIGINS, BOT_GREETING, BOT_NAME
+from app.config import ADMIN_SECRET, ALLOWED_ORIGINS, BOT_GREETING, BOT_NAME
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -31,6 +33,37 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Chat log (in-memory, persisted to file) ─────────────────────────
+CHAT_LOG_PATH = Path("data/chat_log.json")
+_chat_log: list[dict] = []
+
+
+def _load_chat_log():
+    global _chat_log
+    if CHAT_LOG_PATH.exists():
+        try:
+            _chat_log = json.loads(CHAT_LOG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _chat_log = []
+
+
+def _save_chat_log():
+    CHAT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHAT_LOG_PATH.write_text(json.dumps(_chat_log, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_chat(ip: str, question: str, sources: list[dict]):
+    _chat_log.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "ip": ip,
+        "question": question,
+        "sources": sources,
+    })
+    # Save every 5 entries to reduce disk writes
+    if len(_chat_log) % 5 == 0:
+        _save_chat_log()
+
 
 # ── In-memory rate limiter ───────────────────────────────────────────
 _rate_store: dict[str, list[float]] = {}
@@ -81,6 +114,8 @@ async def _keep_alive():
 
 @app.on_event("startup")
 async def startup():
+    _load_chat_log()
+    log.info("Loaded %d chat log entries", len(_chat_log))
     try:
         n = rag.load_embeddings()
         log.info("Bot ready with %d chunks from document", n)
@@ -91,6 +126,12 @@ async def startup():
         log.error("GEMINI_API_KEY is invalid or Gemini API unreachable")
     # Start keep-alive background task
     asyncio.create_task(_keep_alive())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    _save_chat_log()
+    log.info("Chat log saved (%d entries)", len(_chat_log))
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -131,6 +172,7 @@ async def chat(req: ChatRequest, request: Request):
         return JSONResponse(status_code=500, content={"error": f"Retrieval error: {exc}"})
 
     sources = [{"page": c["page"], "score": round(c["score"], 3)} for c in chunks]
+    log_chat(ip, query, sources)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
@@ -163,3 +205,89 @@ async def serve_widget(request: Request):
     js = js.replace("__BOT_NAME__", BOT_NAME)
     js = js.replace("__BOT_GREETING__", BOT_GREETING)
     return Response(content=js, media_type="application/javascript")
+
+
+# ── Analytics dashboard ─────────────────────────────────────────────
+
+@app.get("/api/analytics")
+async def analytics(secret: str = ""):
+    if secret != ADMIN_SECRET:
+        return JSONResponse(status_code=401, content={"error": "Invalid secret"})
+    total = len(_chat_log)
+    unique_ips = len(set(e["ip"] for e in _chat_log)) if _chat_log else 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_count = sum(1 for e in _chat_log if e["timestamp"].startswith(today))
+    return {
+        "total_questions": total,
+        "unique_users": unique_ips,
+        "today_questions": today_count,
+    }
+
+
+@app.get("/api/analytics/logs")
+async def analytics_logs(secret: str = "", limit: int = 50, offset: int = 0):
+    if secret != ADMIN_SECRET:
+        return JSONResponse(status_code=401, content={"error": "Invalid secret"})
+    recent = list(reversed(_chat_log))
+    return {
+        "total": len(_chat_log),
+        "logs": recent[offset : offset + limit],
+    }
+
+
+@app.get("/dashboard")
+async def dashboard(secret: str = ""):
+    if secret != ADMIN_SECRET:
+        return Response(content="<h3>Unauthorized. Add ?secret=YOUR_SECRET to the URL.</h3>", media_type="text/html")
+    html = """<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Chat Analytics</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Inter',system-ui,sans-serif;background:#f7f8fc;color:#333;padding:24px}
+h1{color:#2D2B7F;margin-bottom:24px;font-size:24px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:32px}
+.stat{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(45,43,127,.08);border:1px solid #ececf4}
+.stat .num{font-size:32px;font-weight:700;color:#2D2B7F}
+.stat .label{font-size:13px;color:#888;margin-top:4px}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 10px rgba(45,43,127,.08)}
+th{background:#2D2B7F;color:#fff;padding:12px 16px;text-align:left;font-size:13px;font-weight:600}
+td{padding:10px 16px;border-bottom:1px solid #ececf4;font-size:13px}
+tr:hover td{background:#f7f8fc}
+.q{max-width:400px;word-wrap:break-word}
+.time{color:#888;white-space:nowrap}
+.refresh{background:#5BC5C8;color:#fff;border:none;padding:8px 20px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;margin-bottom:16px}
+.refresh:hover{background:#4ab0b3}
+</style></head><body>
+<h1>Chat Analytics Dashboard</h1>
+<button class="refresh" onclick="load()">Refresh</button>
+<div class="stats">
+<div class="stat"><div class="num" id="total">-</div><div class="label">Total Questions</div></div>
+<div class="stat"><div class="num" id="today">-</div><div class="label">Today</div></div>
+<div class="stat"><div class="num" id="users">-</div><div class="label">Unique Users</div></div>
+</div>
+<table><thead><tr><th>Time</th><th>Question</th><th>Pages Used</th><th>IP</th></tr></thead>
+<tbody id="logs"></tbody></table>
+<script>
+var SECRET='""" + ADMIN_SECRET + """';
+function load(){
+  fetch('/api/analytics?secret='+SECRET).then(r=>r.json()).then(d=>{
+    document.getElementById('total').textContent=d.total_questions;
+    document.getElementById('today').textContent=d.today_questions;
+    document.getElementById('users').textContent=d.unique_users;
+  });
+  fetch('/api/analytics/logs?secret='+SECRET+'&limit=100').then(r=>r.json()).then(d=>{
+    var h='';
+    d.logs.forEach(function(e){
+      var t=new Date(e.timestamp).toLocaleString();
+      var pages=e.sources.map(function(s){return 'P'+s.page}).join(', ');
+      h+='<tr><td class="time">'+t+'</td><td class="q">'+esc(e.question)+'</td><td>'+pages+'</td><td>'+e.ip+'</td></tr>';
+    });
+    document.getElementById('logs').innerHTML=h;
+  });
+}
+function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
+load();
+</script></body></html>"""
+    return Response(content=html, media_type="text/html")
