@@ -101,8 +101,7 @@
   var history = [];
 
   // Hide mic if browser doesn't support speech recognition
-  var SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) { micBtn.style.display = "none"; }
+  if (!(window.SpeechRecognition || window.webkitSpeechRecognition)) { micBtn.style.display = "none"; }
 
   // Show greeting
   addMsg(GREETING, "bot");
@@ -154,79 +153,137 @@
   }
 
   /* ── Voice input (Web Speech API) ─────────────────────────────── */
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   var _rec = null;
-  var _recText = "";      // accumulated final text across restarts
-  var _wantStop = false;  // user tapped mic to stop
+  var _recText = "";
+  var _wantStop = false;
+  var _isStarting = false;
+  var _restartTimer = null;
+  var _recLang = "en-IN";
 
-  function startMic() {
-    if (!SpeechRecognition || isBusy) return;
-    _wantStop = false;
-    _recText = "";
-    input.value = "";
+  function supportsSpeech() { return !!SR; }
+
+  function resetMicUI() {
+    isRecording = false;
+    micBtn.classList.remove("psb-recording");
+    input.placeholder = "Type or speak\u2026";
+  }
+
+  function setMicUI() {
     isRecording = true;
     micBtn.classList.add("psb-recording");
     input.placeholder = "Listening... tap mic to stop";
-    _launchRec();
+  }
+
+  function resizeInput() {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 80) + "px";
+  }
+
+  function startMic(lang) {
+    if (!supportsSpeech() || isBusy) return;
+    if (lang) _recLang = lang;
+    _wantStop = false;
+    _recText = input.value ? input.value.trim() + " " : "";
+    clearTimeout(_restartTimer);
+    setMicUI();
+    startRecognition();
   }
 
   function stopMic() {
     _wantStop = true;
-    isRecording = false;
-    micBtn.classList.remove("psb-recording");
-    input.placeholder = "Type or speak\u2026";
-    if (_rec) { try { _rec.stop(); } catch (e) {} }
+    clearTimeout(_restartTimer);
+    resetMicUI();
+    if (_rec) {
+      try {
+        _rec.onend = null;
+        _rec.onerror = null;
+        _rec.onresult = null;
+        _rec.abort();
+      } catch (e) {}
+    }
     _rec = null;
+    _isStarting = false;
     if (input.value.trim()) input.focus();
   }
 
-  function _launchRec() {
-    // Create a fresh instance every time — avoids stale state bugs in Chrome/Safari
-    _rec = new SpeechRecognition();
-    _rec.continuous = false;      // single utterance — we manually restart
-    _rec.interimResults = true;
-    _rec.lang = "hi-IN";         // Hindi primary — Chrome picks up English too
-    _rec.maxAlternatives = 1;
+  function startRecognition() {
+    if (_wantStop || !isRecording || _isStarting) return;
+    if (_rec) {
+      try { _rec.abort(); } catch (e) {}
+      _rec = null;
+    }
+    _isStarting = true;
 
-    _rec.onresult = function (e) {
+    var rec = new SR();
+    _rec = rec;
+    rec.continuous = true;
+    rec.interimResults = true;
+    rec.lang = _recLang;
+    rec.maxAlternatives = 1;
+
+    rec.onstart = function () {
+      _isStarting = false;
+    };
+
+    rec.onresult = function (e) {
+      var finalChunk = "";
       var interim = "";
-      for (var i = 0; i < e.results.length; i++) {
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var transcript = e.results[i][0].transcript;
         if (e.results[i].isFinal) {
-          _recText += e.results[i][0].transcript + " ";
+          finalChunk += transcript + " ";
         } else {
-          interim += e.results[i][0].transcript;
+          interim += transcript;
         }
       }
+      if (finalChunk) _recText += finalChunk;
       input.value = (_recText + interim).trim();
-      input.style.height = "auto";
-      input.style.height = Math.min(input.scrollHeight, 80) + "px";
+      resizeInput();
     };
 
-    _rec.onend = function () {
-      _rec = null;
-      if (_wantStop || !isRecording) return;
-      // Auto-restart to keep listening for more speech
-      setTimeout(function () {
-        if (isRecording && !_wantStop) _launchRec();
-      }, 100);
-    };
-
-    _rec.onerror = function (e) {
-      if (e.error === "no-speech" || e.error === "aborted") {
-        // Expected — just restart
+    rec.onerror = function (e) {
+      _isStarting = false;
+      if (e.error === "no-speech" || e.error === "audio-capture") {
+        scheduleRestart();
         return;
       }
-      stopMic();
-      if (e.error === "not-allowed") {
+      if (e.error === "aborted") return;
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        stopMic();
         errorMsg("Microphone access denied. Please allow mic permission in browser settings.");
+        return;
       }
+      scheduleRestart();
     };
 
-    try { _rec.start(); } catch (e) { stopMic(); }
+    rec.onend = function () {
+      _isStarting = false;
+      _rec = null;
+      if (_wantStop || !isRecording) return;
+      scheduleRestart();
+    };
+
+    try {
+      rec.start();
+    } catch (e) {
+      _isStarting = false;
+      scheduleRestart(300);
+    }
+  }
+
+  function scheduleRestart(delay) {
+    delay = delay || 250;
+    if (_wantStop || !isRecording) return;
+    clearTimeout(_restartTimer);
+    _restartTimer = setTimeout(function () {
+      if (!_wantStop && isRecording) startRecognition();
+    }, delay);
   }
 
   micBtn.onclick = function () {
-    if (!SpeechRecognition || isBusy) return;
-    if (isRecording) { stopMic(); } else { startMic(); }
+    if (!supportsSpeech() || isBusy) return;
+    if (isRecording) { stopMic(); } else { startMic("en-IN"); }
   };
 
   /* ── SSE streaming with auto-retry ──────────────────────────────── */
