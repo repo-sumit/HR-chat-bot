@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from typing import AsyncGenerator
 
 import numpy as np
@@ -99,12 +101,21 @@ def retrieve(query_embedding: np.ndarray, top_k: int = MAX_CONTEXT_CHUNKS) -> li
 
 
 async def embed_query(text: str) -> np.ndarray:
-    """Embed a single query string using Gemini embedding model."""
-    resp = client.models.embed_content(
-        model=f"models/{EMBEDDING_MODEL}",
-        contents=text,
-    )
-    return np.array(resp.embeddings[0].values, dtype=np.float32)
+    """Embed a single query string using Gemini embedding model, with retry on 429."""
+    for attempt in range(3):
+        try:
+            resp = client.models.embed_content(
+                model=f"models/{EMBEDDING_MODEL}",
+                contents=text,
+            )
+            return np.array(resp.embeddings[0].values, dtype=np.float32)
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                wait = (attempt + 1) * 10
+                log.warning("Embedding rate-limited, retrying in %ds...", wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
 
 
 # ── generation (streaming) ───────────────────────────────────────────
@@ -139,17 +150,27 @@ async def generate_response(
     chunks: list[dict],
     history: list[dict] | None = None,
 ) -> AsyncGenerator[str, None]:
-    """Stream tokens from Gemini for the given query + retrieved chunks."""
+    """Stream tokens from Gemini for the given query + retrieved chunks, with retry on 429."""
     contents = _build_prompt(query, chunks, history)
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=TEMPERATURE,
     )
-    stream = client.models.generate_content_stream(
-        model=f"models/{GEMINI_MODEL}",
-        contents=contents,
-        config=config,
-    )
-    for response_chunk in stream:
-        if response_chunk.text:
-            yield response_chunk.text
+    for attempt in range(3):
+        try:
+            stream = client.models.generate_content_stream(
+                model=f"models/{GEMINI_MODEL}",
+                contents=contents,
+                config=config,
+            )
+            for response_chunk in stream:
+                if response_chunk.text:
+                    yield response_chunk.text
+            return  # success, exit retry loop
+        except Exception as e:
+            if "429" in str(e) and attempt < 2:
+                wait = (attempt + 1) * 10
+                log.warning("Generation rate-limited, retrying in %ds...", wait)
+                await asyncio.sleep(wait)
+            else:
+                raise
