@@ -124,23 +124,22 @@ def _friendly_error(exc: Exception) -> str:
 
 # ── Startup ──────────────────────────────────────────────────────────
 
-SELF_PING_URL = os.getenv("RENDER_EXTERNAL_URL")  # auto-set by Render
-SELF_PING_INTERVAL = 600  # every 10 minutes
+SELF_PING_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://hr-chat-bot-jr1z.onrender.com"
+SELF_PING_INTERVAL = 300  # every 5 minutes (Render sleeps after 15min)
 
 
 async def _keep_alive():
-    """Ping ourselves periodically to prevent Render free-tier sleep."""
-    if not SELF_PING_URL:
-        return
+    """Ping ourselves every 5 minutes to prevent Render free-tier sleep."""
+    await asyncio.sleep(10)  # wait for server to fully start
     log.info("Keep-alive started: pinging %s every %ds", SELF_PING_URL, SELF_PING_INTERVAL)
     async with httpx.AsyncClient() as client:
         while True:
-            await asyncio.sleep(SELF_PING_INTERVAL)
             try:
-                resp = await client.get(f"{SELF_PING_URL}/", timeout=10)
-                log.debug("Keep-alive ping: %s", resp.status_code)
+                resp = await client.get(f"{SELF_PING_URL}/", timeout=30)
+                log.info("Keep-alive ping: %s", resp.status_code)
             except Exception as exc:
                 log.warning("Keep-alive ping failed: %s", exc)
+            await asyncio.sleep(SELF_PING_INTERVAL)
 
 
 @app.on_event("startup")

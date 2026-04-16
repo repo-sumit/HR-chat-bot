@@ -95,6 +95,13 @@
   // Show greeting
   addMsg(GREETING, "bot");
 
+  /* ── Server warm-up ───────────────────────────────────────────── */
+  var serverReady = false;
+  function warmUp() {
+    fetch(API + "/", { method: "GET" }).then(function () { serverReady = true; }).catch(function () {});
+  }
+  warmUp(); // ping on page load
+
   /* ── Toggle ────────────────────────────────────────────────────── */
   function isMobile() { return window.innerWidth <= 480; }
 
@@ -103,7 +110,7 @@
     win.classList.toggle("psb-open", isOpen);
     bubble.classList.remove("psb-pulse");
     if (isMobile()) bubble.classList.toggle("psb-hidden", isOpen);
-    if (isOpen) input.focus();
+    if (isOpen) { warmUp(); input.focus(); }
   };
   closeBtn.onclick = function () {
     isOpen = false;
@@ -134,11 +141,23 @@
     streamResponse(text);
   }
 
-  /* ── SSE streaming ─────────────────────────────────────────────── */
-  function streamResponse(text) {
+  /* ── SSE streaming with auto-retry ──────────────────────────────── */
+  var MAX_RETRIES = 3;
+  var RETRY_DELAYS = [5000, 10000, 15000]; // 5s, 10s, 15s
+
+  function streamResponse(text, retryCount) {
+    retryCount = retryCount || 0;
     var typing = showTyping();
+    var statusDiv = null;
     var botDiv = null;
     var fullText = "";
+
+    if (retryCount > 0) {
+      statusDiv = addMsg("Server is waking up... attempt " + (retryCount + 1) + "/" + (MAX_RETRIES + 1), "bot");
+      statusDiv.style.color = "#5BC5C8";
+      statusDiv.style.fontStyle = "italic";
+      statusDiv.style.fontSize = "12px";
+    }
 
     fetch(API + "/api/chat", {
       method: "POST",
@@ -146,9 +165,11 @@
       body: JSON.stringify({ message: text, history: history.slice(-6) }),
     })
       .then(function (res) {
+        if (statusDiv) removeEl(statusDiv);
         if (!res.ok) {
           return res.json().then(function (d) { throw new Error(d.error || "Server error"); });
         }
+        serverReady = true;
         var reader = res.body.getReader();
         var decoder = new TextDecoder();
         var buffer = "";
@@ -191,11 +212,33 @@
               }
             }
             read();
-          }).catch(function (err) { removeEl(typing); errorMsg(friendlyNetworkError(err)); finish(); });
+          }).catch(function (err) { handleError(err); });
         }
         read();
       })
-      .catch(function (err) { removeEl(typing); errorMsg(friendlyNetworkError(err)); finish(); });
+      .catch(function (err) { handleError(err); });
+
+    function handleError(err) {
+      var msg = (err && err.message) ? err.message.toLowerCase() : "";
+      var isNetworkErr = msg.includes("failed to fetch") || msg.includes("network") || msg.includes("load failed") || msg.includes("timeout");
+      if (isNetworkErr && retryCount < MAX_RETRIES) {
+        removeEl(typing); typing = null;
+        if (statusDiv) removeEl(statusDiv);
+        var waitDiv = addMsg("Server is starting up... retrying in " + (RETRY_DELAYS[retryCount] / 1000) + "s", "bot");
+        waitDiv.style.color = "#5BC5C8";
+        waitDiv.style.fontStyle = "italic";
+        waitDiv.style.fontSize = "12px";
+        setTimeout(function () {
+          removeEl(waitDiv);
+          streamResponse(text, retryCount + 1);
+        }, RETRY_DELAYS[retryCount]);
+      } else {
+        removeEl(typing); typing = null;
+        if (statusDiv) removeEl(statusDiv);
+        errorMsg(friendlyNetworkError(err));
+        finish();
+      }
+    }
 
     function finish() {
       if (typing) removeEl(typing);
