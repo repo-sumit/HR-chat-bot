@@ -20,3 +20,5 @@ ALLOWED_ORIGINS: list[str] = [
     if o.strip()
 ]
 ADMIN_SECRET: str = os.getenv("ADMIN_SECRET", "changeme123")
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")

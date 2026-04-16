@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 
 from app import rag
-from app.config import ADMIN_SECRET, ALLOWED_ORIGINS, BOT_GREETING, BOT_NAME
+from app.config import ADMIN_SECRET, ALLOWED_ORIGINS, BOT_GREETING, BOT_NAME, SUPABASE_KEY, SUPABASE_URL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -34,35 +34,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Chat log (in-memory, persisted to file) ─────────────────────────
-CHAT_LOG_PATH = Path("data/chat_log.json")
-_chat_log: list[dict] = []
+# ── Supabase chat logging ───────────────────────────────────────────
+_supabase_headers = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=minimal",
+}
+_supabase_client: httpx.AsyncClient | None = None
 
 
-def _load_chat_log():
-    global _chat_log
-    if CHAT_LOG_PATH.exists():
-        try:
-            _chat_log = json.loads(CHAT_LOG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            _chat_log = []
+async def _get_supabase_client() -> httpx.AsyncClient:
+    global _supabase_client
+    if _supabase_client is None:
+        _supabase_client = httpx.AsyncClient(
+            base_url=f"{SUPABASE_URL}/rest/v1",
+            headers=_supabase_headers,
+        )
+    return _supabase_client
 
 
-def _save_chat_log():
-    CHAT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CHAT_LOG_PATH.write_text(json.dumps(_chat_log, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def log_chat(ip: str, question: str, sources: list[dict]):
-    _chat_log.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "ip": ip,
-        "question": question,
-        "sources": sources,
-    })
-    # Save every 5 entries to reduce disk writes
-    if len(_chat_log) % 5 == 0:
-        _save_chat_log()
+async def log_chat(ip: str, question: str, sources: list[dict]):
+    if not SUPABASE_URL:
+        return
+    try:
+        client = await _get_supabase_client()
+        await client.post("/chat_logs", json={
+            "ip": ip,
+            "question": question,
+            "sources": json.dumps(sources),
+        })
+    except Exception as exc:
+        log.warning("Supabase log failed: %s", exc)
 
 
 # ── In-memory rate limiter ───────────────────────────────────────────
@@ -114,8 +117,6 @@ async def _keep_alive():
 
 @app.on_event("startup")
 async def startup():
-    _load_chat_log()
-    log.info("Loaded %d chat log entries", len(_chat_log))
     try:
         n = rag.load_embeddings()
         log.info("Bot ready with %d chunks from document", n)
@@ -124,14 +125,16 @@ async def startup():
     ok = await rag.verify_api_key()
     if not ok:
         log.error("GEMINI_API_KEY is invalid or Gemini API unreachable")
+    if SUPABASE_URL:
+        log.info("Supabase logging enabled: %s", SUPABASE_URL)
     # Start keep-alive background task
     asyncio.create_task(_keep_alive())
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    _save_chat_log()
-    log.info("Chat log saved (%d entries)", len(_chat_log))
+    if _supabase_client:
+        await _supabase_client.aclose()
 
 
 # ── Routes ───────────────────────────────────────────────────────────
@@ -172,7 +175,7 @@ async def chat(req: ChatRequest, request: Request):
         return JSONResponse(status_code=500, content={"error": f"Retrieval error: {exc}"})
 
     sources = [{"page": c["page"], "score": round(c["score"], 3)} for c in chunks]
-    log_chat(ip, query, sources)
+    await log_chat(ip, query, sources)
 
     async def event_stream() -> AsyncGenerator[str, None]:
         try:
@@ -213,13 +216,20 @@ async def serve_widget(request: Request):
 async def analytics(secret: str = ""):
     if secret != ADMIN_SECRET:
         return JSONResponse(status_code=401, content={"error": "Invalid secret"})
-    total = len(_chat_log)
-    unique_ips = len(set(e["ip"] for e in _chat_log)) if _chat_log else 0
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    today_count = sum(1 for e in _chat_log if e["timestamp"].startswith(today))
+    client = await _get_supabase_client()
+    # Total count
+    r = await client.get("/chat_logs?select=id", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
+    total = int(r.headers.get("content-range", "*/0").split("/")[-1])
+    # Today count
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
+    r2 = await client.get(f"/chat_logs?select=id&created_at=gte.{today}", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
+    today_count = int(r2.headers.get("content-range", "*/0").split("/")[-1])
+    # Unique IPs
+    r3 = await client.get("/chat_logs?select=ip")
+    ips = set(row["ip"] for row in r3.json()) if r3.status_code == 200 else set()
     return {
         "total_questions": total,
-        "unique_users": unique_ips,
+        "unique_users": len(ips),
         "today_questions": today_count,
     }
 
@@ -228,11 +238,19 @@ async def analytics(secret: str = ""):
 async def analytics_logs(secret: str = "", limit: int = 50, offset: int = 0):
     if secret != ADMIN_SECRET:
         return JSONResponse(status_code=401, content={"error": "Invalid secret"})
-    recent = list(reversed(_chat_log))
-    return {
-        "total": len(_chat_log),
-        "logs": recent[offset : offset + limit],
-    }
+    client = await _get_supabase_client()
+    r = await client.get(
+        f"/chat_logs?select=*&order=created_at.desc&limit={limit}&offset={offset}",
+    )
+    logs = r.json() if r.status_code == 200 else []
+    # Remap fields for dashboard compatibility
+    for entry in logs:
+        entry["timestamp"] = entry.pop("created_at", "")
+        if isinstance(entry.get("sources"), str):
+            entry["sources"] = json.loads(entry["sources"])
+    r2 = await client.get("/chat_logs?select=id", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
+    total = int(r2.headers.get("content-range", "*/0").split("/")[-1])
+    return {"total": total, "logs": logs}
 
 
 @app.get("/dashboard")
