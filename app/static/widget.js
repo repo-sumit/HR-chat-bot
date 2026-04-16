@@ -47,6 +47,7 @@
     @media(max-width:480px){
       .psb-window{width:100vw;height:100vh;bottom:0;${POS==="bottom-left"?"left":"right"}:0;border-radius:0}
       .psb-bubble{bottom:12px;${POS==="bottom-left"?"left":"right"}:12px}
+      .psb-bubble.psb-hidden{display:none}
     }
   `;
   var style = document.createElement("style");
@@ -88,15 +89,19 @@
   addMsg(GREETING, "bot");
 
   /* ── Toggle ────────────────────────────────────────────────────── */
+  function isMobile() { return window.innerWidth <= 480; }
+
   bubble.onclick = function () {
     isOpen = !isOpen;
     win.classList.toggle("psb-open", isOpen);
     bubble.classList.remove("psb-pulse");
+    if (isMobile()) bubble.classList.toggle("psb-hidden", isOpen);
     if (isOpen) input.focus();
   };
   closeBtn.onclick = function () {
     isOpen = false;
     win.classList.remove("psb-open");
+    bubble.classList.remove("psb-hidden");
   };
 
   /* ── Send message ──────────────────────────────────────────────── */
