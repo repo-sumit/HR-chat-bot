@@ -56,14 +56,17 @@ async def _get_supabase_client() -> httpx.AsyncClient:
 
 async def log_chat(ip: str, question: str, sources: list[dict]):
     if not SUPABASE_URL:
+        log.warning("Supabase logging skipped: SUPABASE_URL not set")
         return
     try:
         client = await _get_supabase_client()
-        await client.post("/chat_logs", json={
+        resp = await client.post("/chat_logs", json={
             "ip": ip,
             "question": question,
             "sources": json.dumps(sources),
         })
+        if resp.status_code >= 400:
+            log.warning("Supabase log rejected (%s): %s", resp.status_code, resp.text)
     except Exception as exc:
         log.warning("Supabase log failed: %s", exc)
 
