@@ -26,21 +26,28 @@ def main() -> int:
         print("\nFAIL: SUPABASE_URL or SUPABASE_KEY is empty. Check your .env file.")
         return 1
 
-    # Guess key type from JWT payload
-    try:
-        import base64
-        payload_b64 = SUPABASE_KEY.split(".")[1]
-        payload_b64 += "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.b64decode(payload_b64))
-        role = payload.get("role", "unknown")
-        print(f"[1] Key role: {role}")
-        if role == "anon":
-            print("    WARNING: 'anon' key — RLS will block inserts unless a policy allows it.")
-            print("    Use the 'service_role' key for server-side logging.")
-        elif role == "service_role":
-            print("    OK: service_role key bypasses RLS.")
-    except Exception:
-        print("[1] Could not decode key payload.")
+    # Detect key type
+    if SUPABASE_KEY.startswith("sb_secret_"):
+        print("[1] Key type: sb_secret_ (new secret key — bypasses RLS) OK")
+    elif SUPABASE_KEY.startswith("sb_publishable_"):
+        print("[1] Key type: sb_publishable_ (new publishable key — RLS applies)")
+        print("    WARNING: publishable key will be blocked by RLS unless a policy allows inserts.")
+    elif SUPABASE_KEY.startswith("eyJ"):
+        try:
+            import base64
+            payload_b64 = SUPABASE_KEY.split(".")[1]
+            payload_b64 += "=" * (-len(payload_b64) % 4)
+            payload = json.loads(base64.b64decode(payload_b64))
+            role = payload.get("role", "unknown")
+            print(f"[1] Key type: legacy JWT, role={role}")
+            if role == "anon":
+                print("    WARNING: 'anon' key — RLS will block inserts unless a policy allows it.")
+            elif role == "service_role":
+                print("    OK: service_role key bypasses RLS.")
+        except Exception:
+            print("[1] Key type: legacy JWT (could not decode payload)")
+    else:
+        print("[1] Key type: unknown format")
 
     headers = {
         "apikey": SUPABASE_KEY,
