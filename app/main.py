@@ -1,342 +1,251 @@
-"""FastAPI application: routes, CORS, SSE streaming, rate limiting."""
-
+"""Stateless Gemini policy chat. No database or transcript persistence."""
 from __future__ import annotations
-
 import asyncio
+import base64
 import json
 import logging
-import os
 import time
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import AsyncGenerator
-
-import httpx
-from fastapi import FastAPI, Request
+from typing import Literal
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from google.genai import types
+from app import config, rag
 
-from datetime import datetime, timezone
-
-from app import rag
-from app.config import ADMIN_SECRET, ALLOWED_ORIGINS, BOT_GREETING, BOT_NAME, SUPABASE_KEY, SUPABASE_URL
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
-
-app = FastAPI(title="PDF Support Bot")
-
-# ── CORS ─────────────────────────────────────────────────────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ── Supabase chat logging ───────────────────────────────────────────
-_supabase_headers = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=minimal",
-}
-_supabase_client: httpx.AsyncClient | None = None
+_ready = False
+_rate_store = {}
+_voice_connections = 0
 
 
-async def _get_supabase_client() -> httpx.AsyncClient:
-    global _supabase_client
-    if _supabase_client is None:
-        _supabase_client = httpx.AsyncClient(
-            base_url=f"{SUPABASE_URL}/rest/v1",
-            headers=_supabase_headers,
-        )
-    return _supabase_client
-
-
-async def log_chat(ip: str, question: str, sources: list[dict]):
-    if not SUPABASE_URL:
-        log.warning("Supabase logging skipped: SUPABASE_URL not set")
-        return
-    try:
-        client = await _get_supabase_client()
-        resp = await client.post("/chat_logs", json={
-            "ip": ip,
-            "question": question,
-            "sources": json.dumps(sources),
-        })
-        if resp.status_code >= 400:
-            log.warning("Supabase log rejected (%s): %s", resp.status_code, resp.text)
-    except Exception as exc:
-        log.warning("Supabase log failed: %s", exc)
-
-
-# ── In-memory rate limiter ───────────────────────────────────────────
-_rate_store: dict[str, list[float]] = {}
-RATE_LIMIT = 30       # requests
-RATE_WINDOW = 60.0    # seconds
-
-
-def _is_rate_limited(ip: str) -> bool:
-    now = time.time()
-    timestamps = _rate_store.get(ip, [])
-    # prune old entries
-    timestamps = [t for t in timestamps if now - t < RATE_WINDOW]
-    _rate_store[ip] = timestamps
-    if len(timestamps) >= RATE_LIMIT:
+def _is_rate_limited(ip):
+    now = time.monotonic()
+    for key in list(_rate_store):
+        if not _rate_store[key] or now - _rate_store[key][-1] >= 60:
+            del _rate_store[key]
+    entries = [t for t in _rate_store.get(ip, []) if now - t < 60]
+    if len(entries) >= 30 or (ip not in _rate_store and len(_rate_store) >= 10000):
         return True
-    timestamps.append(now)
+    entries.append(now)
+    _rate_store[ip] = entries
     return False
 
 
-def _cleanup_rate_store():
-    """Remove stale IPs to prevent unbounded memory growth."""
-    now = time.time()
-    stale = [ip for ip, ts in _rate_store.items() if not ts or now - ts[-1] > RATE_WINDOW * 2]
-    for ip in stale:
-        del _rate_store[ip]
+def _friendly_error(exc):
+    code = getattr(exc, 'code', None)
+    if code == 429:
+        return 'Gemini quota reached. Please try again later.'
+    if isinstance(exc, TimeoutError):
+        return 'The request timed out. Please try again.'
+    if code in (400, 401, 403, 404):
+        return 'Gemini configuration or model access needs attention. Please contact the administrator.'
+    return 'The service is temporarily unavailable. Please try again.'
 
 
-# ── Friendly error messages ──────────────────────────────────────────
-
-import re
-
-def _friendly_error(exc: Exception) -> str:
-    msg = str(exc)
-    # Rate limit / quota exceeded
-    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
-        # Try to extract retry delay
-        match = re.search(r'retry in (\d+)', msg, re.IGNORECASE)
-        if match:
-            secs = int(match.group(1))
-            mins = secs // 60
-            remaining = secs % 60
-            if mins > 0:
-                return f"Bot is busy due to high usage. Please try again in {mins}m {remaining}s."
-            return f"Bot is busy due to high usage. Please try again in {secs} seconds."
-        return "Bot is busy due to high usage. Please try again in 1-2 minutes."
-    # Invalid API key
-    if "API_KEY_INVALID" in msg or "API key" in msg:
-        return "Service is temporarily unavailable. Please try again later."
-    # Model overloaded
-    if "503" in msg or "UNAVAILABLE" in msg:
-        return "Service is under heavy load. Please try again in a few minutes."
-    # Generic
-    return "Something went wrong. Please try again in a moment."
-
-
-# ── Startup ──────────────────────────────────────────────────────────
-
-SELF_PING_URL = os.getenv("RENDER_EXTERNAL_URL") or "https://hr-chat-bot-jr1z.onrender.com"
-SELF_PING_INTERVAL = 300  # every 5 minutes (Render sleeps after 15min)
-
-
-async def _keep_alive():
-    """Ping ourselves every 5 minutes to prevent Render free-tier sleep."""
-    await asyncio.sleep(10)  # wait for server to fully start
-    log.info("Keep-alive started: pinging %s every %ds", SELF_PING_URL, SELF_PING_INTERVAL)
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                resp = await client.get(f"{SELF_PING_URL}/", timeout=30)
-                log.info("Keep-alive ping: %s", resp.status_code)
-            except Exception as exc:
-                log.warning("Keep-alive ping failed: %s", exc)
-            await asyncio.sleep(SELF_PING_INTERVAL)
-
-
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+async def lifespan(app):
+    global _ready
     try:
-        n = rag.load_embeddings()
-        log.info("Bot ready with %d chunks from document", n)
-    except FileNotFoundError:
-        log.warning("No embeddings file found — run `python scripts/ingest.py <pdf>` first")
-    ok = await rag.verify_api_key()
-    if not ok:
-        log.error("GEMINI_API_KEY is invalid or Gemini API unreachable")
-    if SUPABASE_URL:
-        log.info("Supabase logging enabled: %s", SUPABASE_URL)
-    # Start keep-alive background task
-    asyncio.create_task(_keep_alive())
+        rag.load_embeddings()
+        async with asyncio.timeout(config.REQUEST_TIMEOUT_SECONDS):
+            await rag.verify_api_key()
+        _ready = True
+    except Exception as exc:
+        # Never log questions, transcripts, API keys or upstream exception bodies.
+        log.error('Readiness failed: %s (code=%s). Check key, model access and policy index.', type(exc).__name__, getattr(exc, 'code', None))
+        _ready = False
+    async def retry_readiness():
+        global _ready
+        while not _ready:
+            await asyncio.sleep(15)
+            try:
+                rag.load_embeddings()
+                async with asyncio.timeout(config.REQUEST_TIMEOUT_SECONDS):
+                    await rag.verify_api_key()
+                _ready = True
+            except Exception as exc:
+                log.warning('Readiness retry failed: %s (code=%s)', type(exc).__name__, getattr(exc, 'code', None))
+    retry_task = asyncio.create_task(retry_readiness()) if not _ready and config.GEMINI_API_KEY else None
+    try:
+        yield
+    finally:
+        if retry_task:
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
+        _ready = False
+        await rag.close_client()
 
 
-@app.on_event("shutdown")
-async def shutdown():
-    if _supabase_client:
-        await _supabase_client.aclose()
+app = FastAPI(title='Gemini HR Support Bot', lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=config.ALLOWED_ORIGINS, allow_methods=['GET', 'POST'], allow_headers=['Content-Type'])
 
 
-# ── Routes ───────────────────────────────────────────────────────────
-
-@app.get("/")
-async def health():
-    return {"status": "ok", "bot_name": BOT_NAME}
+class Turn(BaseModel):
+    role: Literal['user', 'assistant']
+    content: str = Field(min_length=1, max_length=8000)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list[dict] = []
+    message: str = Field(min_length=1, max_length=4000)
+    history: list[Turn] = Field(default_factory=list, max_length=6)
 
 
-@app.post("/api/chat")
+@app.get('/')
+async def health():
+    return {'status': 'ok', 'bot_name': config.BOT_NAME, 'ready': _ready}
+
+
+@app.get('/readyz')
+async def readiness():
+    return JSONResponse({'ready': _ready}, status_code=200 if _ready else 503)
+
+
+@app.post('/api/chat')
 async def chat(req: ChatRequest, request: Request):
-    ip = request.client.host if request.client else "unknown"
-    if _is_rate_limited(ip):
-        return JSONResponse(
-            status_code=429,
-            content={"error": "Rate limit exceeded. Please wait a moment."},
-        )
-
-    # periodic cleanup
-    if len(_rate_store) > 500:
-        _cleanup_rate_store()
-
+    if _is_rate_limited(request.client.host if request.client else 'unknown'):
+        return JSONResponse({'error': 'Too many requests. Please wait a minute.'}, status_code=429)
+    if not _ready:
+        return JSONResponse({'error': 'Bot is not ready. Ask the administrator to check Gemini settings and the policy index.'}, status_code=503)
     query = req.message.strip()
     if not query:
-        return JSONResponse(status_code=400, content={"error": "Empty message"})
+        return JSONResponse({'error': 'Empty message'}, status_code=400)
+    history = [t.model_dump() for t in req.history]
 
-    # Retrieve relevant chunks
-    try:
-        query_emb = await rag.embed_query(query)
-        chunks = rag.retrieve(query_emb)
-    except Exception as exc:
-        log.exception("Retrieval failed")
-        return JSONResponse(status_code=500, content={"error": _friendly_error(exc)})
-
-    sources = [{"page": c["page"], "score": round(c["score"], 3)} for c in chunks]
-    await log_chat(ip, query, sources)
-
-    async def event_stream() -> AsyncGenerator[str, None]:
+    async def events():
         try:
-            async for token in rag.generate_response(query, chunks, req.history):
-                payload = json.dumps({"token": token, "done": False})
-                yield f"data: {payload}\n\n"
-            # final event
-            payload = json.dumps({"token": "", "done": True, "sources": sources})
-            yield f"data: {payload}\n\n"
+            async with asyncio.timeout(config.REQUEST_TIMEOUT_SECONDS):
+                # Include a bounded follow-up context in retrieval, without treating it as policy.
+                prior = [t['content'] for t in history if t['role'] == 'user'][-2:]
+                embedding = await rag.embed_query('\n'.join(prior + [query]))
+                chunks = rag.retrieve(embedding)
+                async for token in rag.generate_response(query, chunks, history):
+                    if await request.is_disconnected():
+                        return
+                    yield 'data: ' + json.dumps({'token': token, 'done': False}) + '\n\n'
+                yield 'data: ' + json.dumps({'token': '', 'done': True, 'sources': [{'page': c['page'], 'score': round(c['score'], 3)} for c in chunks]}) + '\n\n'
         except Exception as exc:
-            log.exception("Generation failed")
-            msg = _friendly_error(exc)
-            err = json.dumps({"token": "", "done": True, "sources": [], "error": msg})
-            yield f"data: {err}\n\n"
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+            log.warning('Chat failed: %s (code=%s)', type(exc).__name__, getattr(exc, 'code', None))
+            yield 'data: ' + json.dumps({'token': '', 'done': True, 'error': _friendly_error(exc)}) + '\n\n'
+    return StreamingResponse(events(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache, no-store', 'X-Accel-Buffering': 'no'})
 
 
-WIDGET_JS_PATH = Path(__file__).parent / "static" / "widget.js"
+@app.get('/widget.js')
+async def widget(request: Request):
+    js = (Path(__file__).parent / 'static/widget.js').read_text()
+    # JSON literals protect names/greetings containing quotes and line breaks.
+    base = str(request.base_url).rstrip('/')
+    if request.headers.get('x-forwarded-proto') == 'https':
+        base = base.replace('http://', 'https://', 1)
+    for key, value in {'__API_BASE_URL__': base, '__BOT_NAME__': config.BOT_NAME, '__BOT_GREETING__': config.BOT_GREETING}.items():
+        js = js.replace('"' + key + '"', json.dumps(value))
+    return Response(js, media_type='application/javascript', headers={'Cache-Control': 'no-cache'})
 
 
-@app.get("/widget.js")
-async def serve_widget(request: Request):
-    """Serve widget.js with the API base URL injected."""
-    js = WIDGET_JS_PATH.read_text(encoding="utf-8")
-    # Determine the base URL from the incoming request
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", request.url.netloc)
-    base_url = f"{scheme}://{host}"
-    js = js.replace("__API_BASE_URL__", base_url)
-    js = js.replace("__BOT_NAME__", BOT_NAME)
-    js = js.replace("__BOT_GREETING__", BOT_GREETING)
-    return Response(content=js, media_type="application/javascript")
+@app.websocket('/api/voice')
+async def voice(ws: WebSocket):
+    global _voice_connections
+    origin = ws.headers.get('origin')
+    if origin not in config.ALLOWED_ORIGINS and '*' not in config.ALLOWED_ORIGINS:
+        await ws.close(code=1008)
+        return
+    ip = ws.client.host if ws.client else 'unknown'
+    if not _ready or _is_rate_limited(ip) or _voice_connections >= config.MAX_VOICE_SESSIONS:
+        await ws.close(code=1013)
+        return
+    _voice_connections += 1
+    tasks = []
+    try:
+        await ws.accept()
+        initial = await asyncio.wait_for(ws.receive_text(), timeout=10)
+        if len(initial) > 100000:
+            raise ValueError('Oversized voice history')
+        initial = json.loads(initial)
+        if initial.get('type') != 'start':
+            raise ValueError('Voice session must begin with start')
+        prior = ChatRequest(message='voice', history=initial.get('history', [])).history
+        context = rag.voice_context()
+        live_config = {
+            'response_modalities': ['AUDIO'],
+            'system_instruction': rag.SYSTEM_PROMPT + '\nFor voice, speak naturally in short sentences. Never read formatting symbols aloud.\n\nPOLICY_CONTEXT:\n' + context,
+            'input_audio_transcription': {}, 'output_audio_transcription': {},
+            'speech_config': {'voice_config': {'prebuilt_voice_config': {'voice_name': config.GEMINI_VOICE}}},
+        }
+        async with asyncio.timeout(config.VOICE_SESSION_SECONDS):
+            async with rag.get_client().aio.live.connect(model=config.GEMINI_LIVE_MODEL, config=live_config) as session:
+                if prior:
+                    await session.send_client_content(turns=[types.Content(role='user' if t.role == 'user' else 'model', parts=[types.Part.from_text(text=t.content)]) for t in prior], turn_complete=False)
+                await ws.send_json({'type': 'ready'})
+
+                async def incoming():
+                    audio_times = []
+                    while True:
+                        raw = await asyncio.wait_for(ws.receive_text(), timeout=30)
+                        if len(raw) > 24000:
+                            raise ValueError('Oversized voice frame')
+                        data = json.loads(raw)
+                        if data.get('type') == 'audio':
+                            now = time.monotonic()
+                            audio_times = [t for t in audio_times if now - t < 1]
+                            if len(audio_times) >= 25:
+                                raise ValueError('Voice frame rate exceeded')
+                            audio_times.append(now)
+                            audio = base64.b64decode(data.get('data', ''), validate=True)
+                            if not audio or len(audio) > 16384 or len(audio) % 2:
+                                raise ValueError('Invalid PCM frame')
+                            await session.send_realtime_input(audio=types.Blob(data=audio, mime_type='audio/pcm;rate=16000'))
+                        elif data.get('type') == 'end_audio':
+                            await session.send_realtime_input(audio_stream_end=True)
+                        elif data.get('type') == 'ping':
+                            continue
+                        elif data.get('type') == 'stop':
+                            return
+                        else:
+                            raise ValueError('Unsupported voice frame')
+
+                async def outgoing():
+                    while True:
+                        async for msg in session.receive():
+                            content = msg.server_content
+                            if not content:
+                                continue
+                            if content.interrupted:
+                                await ws.send_json({'type': 'interrupted'})
+                            if content.input_transcription and content.input_transcription.text:
+                                await ws.send_json({'type': 'transcript', 'role': 'user', 'text': content.input_transcription.text})
+                            if content.output_transcription and content.output_transcription.text:
+                                await ws.send_json({'type': 'transcript', 'role': 'assistant', 'text': content.output_transcription.text})
+                            if content.model_turn:
+                                for part in content.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        await ws.send_json({'type': 'audio', 'data': base64.b64encode(part.inline_data.data).decode(), 'mime_type': part.inline_data.mime_type})
+                            if content.turn_complete:
+                                await ws.send_json({'type': 'turn_complete'})
+                tasks = [asyncio.create_task(incoming()), asyncio.create_task(outgoing())]
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        log.warning('Voice ended: %s (code=%s)', type(exc).__name__, getattr(exc, 'code', None))
+        with suppress(Exception):
+            await ws.send_json({'type': 'error', 'error': _friendly_error(exc)})
+    finally:
+        # Release the capacity slot before any await: cancellation during cleanup
+        # must not permanently consume a voice slot.
+        _voice_connections -= 1
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        with suppress(Exception):
+            await ws.close()
 
 
-# ── Analytics dashboard ─────────────────────────────────────────────
-
-@app.get("/api/analytics")
-async def analytics(secret: str = ""):
-    if secret != ADMIN_SECRET:
-        return JSONResponse(status_code=401, content={"error": "Invalid secret"})
-    client = await _get_supabase_client()
-    # Total count
-    r = await client.get("/chat_logs?select=id", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
-    total = int(r.headers.get("content-range", "*/0").split("/")[-1])
-    # Today count
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%dT00:00:00")
-    r2 = await client.get(f"/chat_logs?select=id&created_at=gte.{today}", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
-    today_count = int(r2.headers.get("content-range", "*/0").split("/")[-1])
-    # Unique IPs
-    r3 = await client.get("/chat_logs?select=ip")
-    ips = set(row["ip"] for row in r3.json()) if r3.status_code == 200 else set()
-    return {
-        "total_questions": total,
-        "unique_users": len(ips),
-        "today_questions": today_count,
-    }
-
-
-@app.get("/api/analytics/logs")
-async def analytics_logs(secret: str = "", limit: int = 50, offset: int = 0):
-    if secret != ADMIN_SECRET:
-        return JSONResponse(status_code=401, content={"error": "Invalid secret"})
-    client = await _get_supabase_client()
-    r = await client.get(
-        f"/chat_logs?select=*&order=created_at.desc&limit={limit}&offset={offset}",
-    )
-    logs = r.json() if r.status_code == 200 else []
-    # Remap fields for dashboard compatibility
-    for entry in logs:
-        entry["timestamp"] = entry.pop("created_at", "")
-        if isinstance(entry.get("sources"), str):
-            entry["sources"] = json.loads(entry["sources"])
-    r2 = await client.get("/chat_logs?select=id", headers={**_supabase_headers, "Prefer": "count=exact", "Range": "0-0"})
-    total = int(r2.headers.get("content-range", "*/0").split("/")[-1])
-    return {"total": total, "logs": logs}
-
-
-@app.get("/dashboard")
-async def dashboard(secret: str = ""):
-    if secret != ADMIN_SECRET:
-        return Response(content="<h3>Unauthorized. Add ?secret=YOUR_SECRET to the URL.</h3>", media_type="text/html")
-    html = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Chat Analytics</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Inter',system-ui,sans-serif;background:#f7f8fc;color:#333;padding:24px}
-h1{color:#2D2B7F;margin-bottom:24px;font-size:24px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:32px}
-.stat{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 10px rgba(45,43,127,.08);border:1px solid #ececf4}
-.stat .num{font-size:32px;font-weight:700;color:#2D2B7F}
-.stat .label{font-size:13px;color:#888;margin-top:4px}
-table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 10px rgba(45,43,127,.08)}
-th{background:#2D2B7F;color:#fff;padding:12px 16px;text-align:left;font-size:13px;font-weight:600}
-td{padding:10px 16px;border-bottom:1px solid #ececf4;font-size:13px}
-tr:hover td{background:#f7f8fc}
-.q{max-width:400px;word-wrap:break-word}
-.time{color:#888;white-space:nowrap}
-.refresh{background:#5BC5C8;color:#fff;border:none;padding:8px 20px;border-radius:8px;cursor:pointer;font-weight:600;font-size:13px;margin-bottom:16px}
-.refresh:hover{background:#4ab0b3}
-</style></head><body>
-<h1>Chat Analytics Dashboard</h1>
-<button class="refresh" onclick="load()">Refresh</button>
-<div class="stats">
-<div class="stat"><div class="num" id="total">-</div><div class="label">Total Questions</div></div>
-<div class="stat"><div class="num" id="today">-</div><div class="label">Today</div></div>
-<div class="stat"><div class="num" id="users">-</div><div class="label">Unique Users</div></div>
-</div>
-<table><thead><tr><th>Time</th><th>Question</th><th>Pages Used</th><th>IP</th></tr></thead>
-<tbody id="logs"></tbody></table>
-<script>
-var SECRET='""" + ADMIN_SECRET + """';
-function load(){
-  fetch('/api/analytics?secret='+SECRET).then(r=>r.json()).then(d=>{
-    document.getElementById('total').textContent=d.total_questions;
-    document.getElementById('today').textContent=d.today_questions;
-    document.getElementById('users').textContent=d.unique_users;
-  });
-  fetch('/api/analytics/logs?secret='+SECRET+'&limit=100').then(r=>r.json()).then(d=>{
-    var h='';
-    d.logs.forEach(function(e){
-      var t=new Date(e.timestamp).toLocaleString();
-      var pages=e.sources.map(function(s){return 'P'+s.page}).join(', ');
-      h+='<tr><td class="time">'+t+'</td><td class="q">'+esc(e.question)+'</td><td>'+pages+'</td><td>'+e.ip+'</td></tr>';
-    });
-    document.getElementById('logs').innerHTML=h;
-  });
-}
-function esc(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML}
-load();
-</script></body></html>"""
-    return Response(content=html, media_type="text/html")
+@app.get('/audio-worklet.js')
+async def audio_worklet():
+    return Response((Path(__file__).parent / 'static/audio-worklet.js').read_text(), media_type='application/javascript', headers={'Cache-Control': 'public, max-age=3600'})

@@ -19,6 +19,7 @@ load_dotenv()
 
 import pymupdf  # PyMuPDF
 from google import genai
+from google.genai import types
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 OUTPUT_PATH = os.getenv("EMBEDDINGS_PATH", "data/embeddings.npz")
@@ -96,6 +97,7 @@ def embed_chunks(texts: list[str], batch_size: int = 50) -> np.ndarray:
             resp = client.models.embed_content(
                 model=f"models/{EMBEDDING_MODEL}",
                 contents=batch,
+                config=types.EmbedContentConfig(output_dimensionality=3072),
             )
             for emb in resp.embeddings:
                 all_embeddings.append(emb.values)
@@ -106,6 +108,7 @@ def embed_chunks(texts: list[str], batch_size: int = 50) -> np.ndarray:
                 resp = client.models.embed_content(
                     model=f"models/{EMBEDDING_MODEL}",
                     contents=batch,
+                    config=types.EmbedContentConfig(output_dimensionality=3072),
                 )
                 for emb in resp.embeddings:
                     all_embeddings.append(emb.values)
@@ -153,8 +156,9 @@ def main():
     np.savez(
         OUTPUT_PATH,
         embeddings=embeddings,
-        chunks=np.array(texts, dtype=object),
-        metadata=np.array(metadata, dtype=object),
+        embedding_model=np.array(EMBEDDING_MODEL),
+        chunks=np.array(texts, dtype=str),
+        metadata=np.array(metadata, dtype=str),
     )
 
     file_size = os.path.getsize(OUTPUT_PATH)

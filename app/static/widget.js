@@ -43,7 +43,7 @@
     .psb-dot:nth-child(3){animation-delay:.3s}
     @keyframes psb-bounce{to{transform:translateY(-6px);background:${TEAL}}}
     .psb-input-bar{display:flex;padding:12px 14px;border-top:1px solid #ececf4;gap:6px;flex-shrink:0;background:#fff;align-items:flex-end}
-    .psb-input{flex:1;border:1px solid #dddde8;border-radius:12px;padding:9px 14px;font-size:14px;outline:none;resize:none;font-family:'Inter',system-ui,sans-serif;max-height:80px;background:#f7f8fc;transition:border-color .2s,background .2s}
+    .psb-input{min-width:0;flex:1;border:1px solid #dddde8;border-radius:12px;padding:9px 14px;font-size:14px;outline:none;resize:none;font-family:'Inter',system-ui,sans-serif;max-height:80px;background:#f7f8fc;transition:border-color .2s,background .2s}
     .psb-input:focus{border-color:${TEAL};background:#fff}
     .psb-send{background:${ACCENT};color:#fff;border:none;border-radius:12px;padding:9px 16px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;letter-spacing:0.2px;transition:background .15s,transform .1s;height:38px}
     .psb-send:hover{background:#3d3ba0}
@@ -52,7 +52,7 @@
     .psb-footer{text-align:center;font-size:11px;color:#9ca3af;padding:6px 0 10px;flex-shrink:0;background:#fff}
     .psb-sources{font-size:11px;color:${TEAL};margin-top:6px;font-weight:500}
     @media(max-width:480px){
-      .psb-window{width:100vw;height:100vh;bottom:0;${POS==="bottom-left"?"left":"right"}:0;border-radius:0}
+      .psb-window{width:100vw;height:100dvh;bottom:0;${POS==="bottom-left"?"left":"right"}:0;border-radius:0}
       .psb-bubble{bottom:12px;${POS==="bottom-left"?"left":"right"}:12px}
       .psb-bubble.psb-hidden{display:none}
     }
@@ -61,187 +61,214 @@
   style.textContent = css;
   document.head.appendChild(style);
 
-  /* ── Build DOM ─────────────────────────────────────────────────── */
-  var wrap = document.createElement("div");
-  wrap.className = "psb-wrap";
+  var voiceStyle = document.createElement("style");
+  voiceStyle.textContent = ".psb-tools{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fff;border-top:1px solid #ececf4}.psb-tools button{border:1px solid #dddde8;border-radius:8px;background:#fff;padding:6px 10px;color:#2D2B7F;cursor:pointer}.psb-tools button:disabled{opacity:.5;cursor:default}.psb-status{font-size:12px;color:#666;flex:1}.psb-tools button:focus-visible,.psb-send:focus-visible,.psb-close:focus-visible{outline:3px solid #5BC5C8;outline-offset:2px}";
+  document.head.appendChild(voiceStyle);
+  var wrap = document.createElement('div'); wrap.className = 'psb-wrap';
+  var bubble = document.createElement('button'); bubble.className = 'psb-bubble';
+  bubble.textContent = 'Chat'; bubble.setAttribute('aria-label', 'Open HR policy chat');
+  var win = document.createElement('div'); win.className = 'psb-window';
+  win.inert = true; win.setAttribute('role', 'dialog'); win.setAttribute('aria-label', BOT); win.setAttribute('aria-hidden', 'true');
+  win.innerHTML = '<div class="psb-header"><span>' + esc(BOT) + '</span><button class="psb-close" aria-label="Close chat">×</button></div>' +
+    '<div class="psb-messages" role="log" aria-live="polite" aria-relevant="additions"></div>' +
+    '<div class="psb-tools"><button class="psb-talk">Talk</button><button class="psb-mute" hidden>Mute</button><button class="psb-stop" disabled>Stop</button><span class="psb-status" role="status">Type or talk</span></div>' +
+    '<div class="psb-input-bar"><textarea class="psb-input" aria-label="Your policy question" placeholder="Ask about a policy…" rows="1" maxlength="4000"></textarea><button class="psb-send">Ask</button></div>' +
+    '<div class="psb-footer">Chats stay in this page. Audio is processed by Gemini.</div>';
+  wrap.append(win, bubble); document.body.appendChild(wrap);
+  var msgArea = win.querySelector('.psb-messages'), input = win.querySelector('.psb-input');
+  var sendBtn = win.querySelector('.psb-send'), closeBtn = win.querySelector('.psb-close');
+  var talkBtn = win.querySelector('.psb-talk'), muteBtn = win.querySelector('.psb-mute');
+  var stopBtn = win.querySelector('.psb-stop'), status = win.querySelector('.psb-status');
+  var isOpen = false, isBusy = false, history = [], controller = null;
+  var ws = null, mic = null, captureContext = null, playbackContext = null, captureNode = null;
+  var micSource = null, audioQueue = new Set(), playbackAt = 0, muted = false;
+  var voiceConnecting = false, voiceEpoch = 0, pingTimer = null, connectTimer = null;
+  var transcriptNodes = {}, transcriptText = {}, lastAudioAt = 0;
+  addMsg(GREETING, 'bot');
 
-  // Chat bubble
-  var bubble = document.createElement("button");
-  bubble.className = "psb-bubble psb-pulse";
-  bubble.innerHTML = '<svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>';
-  bubble.setAttribute("aria-label", "Open chat");
-
-  // Chat window
-  var win = document.createElement("div");
-  win.className = "psb-window";
-  win.innerHTML =
-    '<div class="psb-header"><span>' + esc(BOT) + '</span><button class="psb-close">\u00d7</button></div>' +
-    '<div class="psb-messages"></div>' +
-    '<div class="psb-input-bar"><textarea class="psb-input" placeholder="Type a message\u2026" rows="1"></textarea><button class="psb-send">Ask</button></div>' +
-    '<div class="psb-footer">Powered by ' + esc(BOT) + '</div>';
-
-  wrap.appendChild(win);
-  wrap.appendChild(bubble);
-  document.body.appendChild(wrap);
-
-  var msgArea = win.querySelector(".psb-messages");
-  var input = win.querySelector(".psb-input");
-  var sendBtn = win.querySelector(".psb-send");
-  var closeBtn = win.querySelector(".psb-close");
-  var isOpen = false;
-  var isBusy = false;
-  var history = [];
-
-  // Show greeting
-  addMsg(GREETING, "bot");
-
-  /* ── Server warm-up ───────────────────────────────────────────── */
-  var serverReady = false;
-  function warmUp() {
-    fetch(API + "/", { method: "GET" }).then(function () { serverReady = true; }).catch(function () {});
+  function busy(value) {
+    isBusy = value; sendBtn.disabled = value || !!ws || voiceConnecting;
+    talkBtn.disabled = value || voiceConnecting;
+    input.disabled = !!ws || voiceConnecting;
+    stopBtn.disabled = !value && !ws && !voiceConnecting;
   }
-  warmUp(); // ping on page load
-
-  /* ── Toggle ────────────────────────────────────────────────────── */
-  function isMobile() { return window.innerWidth <= 480; }
-
+  async function warmUp() {
+    try {
+      var response = await fetch(API + '/readyz', {signal: AbortSignal.timeout(65000)});
+      if (!response.ok) throw new Error('Bot is not ready. Check Gemini settings or wait for the server to start.');
+      return true;
+    } catch (err) { if (!isBusy && !ws) status.textContent = 'Server starting or unavailable'; return false; }
+  }
+  warmUp();
   bubble.onclick = function () {
-    isOpen = !isOpen;
-    win.classList.toggle("psb-open", isOpen);
-    bubble.classList.remove("psb-pulse");
-    if (isMobile()) bubble.classList.toggle("psb-hidden", isOpen);
+    isOpen = !isOpen; win.inert = !isOpen; win.classList.toggle('psb-open', isOpen); win.setAttribute('aria-hidden', String(!isOpen));
+    bubble.classList.toggle('psb-hidden', isOpen && window.innerWidth <= 480);
     if (isOpen) { warmUp(); input.focus(); }
+    else stopAll();
   };
   closeBtn.onclick = function () {
-    isOpen = false;
-    win.classList.remove("psb-open");
-    bubble.classList.remove("psb-hidden");
+    stopAll(); isOpen = false; win.inert = true; win.classList.remove('psb-open'); win.setAttribute('aria-hidden', 'true');
+    bubble.classList.remove('psb-hidden'); bubble.focus();
+  };
+  win.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeBtn.click(); });
+  sendBtn.onclick = send;
+  input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+  input.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight,80) + 'px'; });
+  stopBtn.onclick = stopAll;
+  talkBtn.onclick = function() { if (ws) stopVoice(); else startVoice(); };
+  muteBtn.onclick = function() {
+    muted = !muted;
+    if (mic) mic.getAudioTracks().forEach(function(track) { track.enabled = !muted; });
+    if (muted && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'end_audio'}));
+    muteBtn.textContent = muted ? 'Unmute' : 'Mute'; muteBtn.setAttribute('aria-pressed', String(muted));
+    status.textContent = muted ? 'Microphone muted' : 'Listening';
   };
 
-  /* ── Send message ──────────────────────────────────────────────── */
-  sendBtn.onclick = send;
-  input.addEventListener("keydown", function (e) {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-  });
-  // Auto-resize textarea
-  input.addEventListener("input", function () {
-    this.style.height = "auto";
-    this.style.height = Math.min(this.scrollHeight, 80) + "px";
-  });
-
-  function send() {
-    var text = input.value.trim();
-    if (!text || isBusy) return;
-    addMsg(text, "user");
-    history.push({ role: "user", content: text });
-    input.value = "";
-    input.style.height = "auto";
-    isBusy = true;
-    sendBtn.disabled = true;
-    streamResponse(text);
-  }
-
-
-  /* ── SSE streaming with auto-retry ──────────────────────────────── */
-  var MAX_RETRIES = 3;
-  var RETRY_DELAYS = [5000, 10000, 15000]; // 5s, 10s, 15s
-
-  function streamResponse(text, retryCount) {
-    retryCount = retryCount || 0;
-    var typing = showTyping();
-    var statusDiv = null;
-    var botDiv = null;
-    var fullText = "";
-
-    if (retryCount > 0) {
-      statusDiv = addMsg("Server is waking up... attempt " + (retryCount + 1) + "/" + (MAX_RETRIES + 1), "bot");
-      statusDiv.style.color = "#5BC5C8";
-      statusDiv.style.fontStyle = "italic";
-      statusDiv.style.fontSize = "12px";
-    }
-
-    fetch(API + "/api/chat", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: text, history: history.slice(-6) }),
-    })
-      .then(function (res) {
-        if (statusDiv) removeEl(statusDiv);
-        if (!res.ok) {
-          return res.json().then(function (d) { throw new Error(d.error || "Server error"); });
+  async function send() {
+    var text = input.value.trim(); if (!text || isBusy || ws || voiceConnecting) return;
+    var prior = history.slice(-6); addMsg(text, 'user'); input.value = ''; input.style.height = 'auto';
+    busy(true); status.textContent = 'Thinking…';
+    var typing = showTyping(), botDiv = null, fullText = '', completed = false;
+    var ownController = new AbortController(); controller = ownController;
+    var timer = setTimeout(function() { ownController.abort(); }, 90000);
+    var reader;
+    try {
+      var res = await fetch(API + '/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({message:text,history:prior}), signal:ownController.signal});
+      if (!res.ok) { var d = await res.json(); throw new Error(d.error || 'Request failed (' + res.status + ')'); }
+      reader = res.body.getReader(); var decoder = new TextDecoder(), buffer = '';
+      while (!completed) {
+        var packet = await reader.read();
+        buffer += packet.done ? decoder.decode() : decoder.decode(packet.value,{stream:true});
+        var frames = buffer.replace(/\r\n/g,'\n').split('\n\n'); buffer = frames.pop();
+        for (var frame of frames) {
+          var lines = frame.split('\n').filter(function(line) { return line.startsWith('data:'); });
+          if (!lines.length) continue;
+          var event = JSON.parse(lines.map(function(line) { return line.slice(5).trimStart(); }).join('\n'));
+          if (event.error) throw new Error(event.error);
+          if (event.token) {
+            if (!botDiv) { removeEl(typing); typing = null; botDiv = addMsg('', 'bot'); }
+            fullText += event.token; botDiv.innerHTML = renderMarkdown(fullText); msgArea.scrollTop = msgArea.scrollHeight;
+          }
+          if (event.done) { completed = true; break; }
         }
-        serverReady = true;
-        var reader = res.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = "";
-
-        function read() {
-          reader.read().then(function (result) {
-            if (result.done) { finish(); return; }
-            buffer += decoder.decode(result.value, { stream: true });
-            var lines = buffer.split("\n");
-            buffer = lines.pop() || "";
-            for (var i = 0; i < lines.length; i++) {
-              var line = lines[i];
-              if (line.startsWith("data: ")) {
-                try {
-                  var d = JSON.parse(line.slice(6));
-                  if (d.error) {
-                    removeEl(typing); typing = null;
-                    errorMsg(d.error);
-                    finish();
-                    return;
-                  }
-                  if (d.token) {
-                    if (!botDiv) { removeEl(typing); typing = null; botDiv = addMsg("", "bot"); }
-                    fullText += d.token;
-                    botDiv.innerHTML = renderMarkdown(fullText);
-                    msgArea.scrollTop = msgArea.scrollHeight;
-                  }
-                  if (d.done) {
-                    history.push({ role: "assistant", content: fullText });
-                    finish();
-                    return;
-                  }
-                } catch (e) { /* skip malformed line */ }
-              }
-            }
-            read();
-          }).catch(function (err) { handleError(err); });
-        }
-        read();
-      })
-      .catch(function (err) { handleError(err); });
-
-    function handleError(err) {
-      var msg = (err && err.message) ? err.message.toLowerCase() : "";
-      var isNetworkErr = msg.includes("failed to fetch") || msg.includes("network") || msg.includes("load failed") || msg.includes("timeout");
-      if (isNetworkErr && retryCount < MAX_RETRIES) {
-        removeEl(typing); typing = null;
-        if (statusDiv) removeEl(statusDiv);
-        var waitDiv = addMsg("Server is starting up... retrying in " + (RETRY_DELAYS[retryCount] / 1000) + "s", "bot");
-        waitDiv.style.color = "#5BC5C8";
-        waitDiv.style.fontStyle = "italic";
-        waitDiv.style.fontSize = "12px";
-        setTimeout(function () {
-          removeEl(waitDiv);
-          streamResponse(text, retryCount + 1);
-        }, RETRY_DELAYS[retryCount]);
-      } else {
-        removeEl(typing); typing = null;
-        if (statusDiv) removeEl(statusDiv);
-        errorMsg(friendlyNetworkError(err));
-        finish();
+        if (packet.done && !completed) throw new Error('The response was interrupted. Please try again.');
       }
-    }
-
-    function finish() {
-      if (typing) removeEl(typing);
-      isBusy = false;
-      sendBtn.disabled = false;
-      msgArea.scrollTop = msgArea.scrollHeight;
+      if (!fullText.trim()) throw new Error('No answer received. Please try again.');
+      history = prior.concat([{role:'user',content:text},{role:'assistant',content:fullText.slice(0,8000)}]).slice(-6);
+      status.textContent = 'Ready';
+    } catch (err) {
+      if (botDiv) { var note = document.createElement('div'); note.textContent = 'Incomplete response'; botDiv.appendChild(note); }
+      if (err.name !== 'AbortError') errorMsg(err.message);
+      status.textContent = err.name === 'AbortError' ? 'Stopped or timed out' : 'Could not answer';
+    } finally {
+      clearTimeout(timer); if (reader) { try { await reader.cancel(); } catch (_) {} }
+      removeEl(typing); if (controller === ownController) { controller = null; busy(false); }
     }
   }
+
+  function stopPlayback() {
+    audioQueue.forEach(function(source) { try { source.stop(); } catch (_) {} }); audioQueue.clear();
+    playbackAt = playbackContext ? playbackContext.currentTime : 0;
+  }
+  function stopVoice() {
+    voiceEpoch++; voiceConnecting = false;
+    clearInterval(pingTimer); clearTimeout(connectTimer); pingTimer = connectTimer = null;
+    if (ws) { ws.onclose = null; ws.close(); ws = null; }
+    if (captureNode) { captureNode.disconnect(); captureNode = null; }
+    if (micSource) { micSource.disconnect(); micSource = null; }
+    if (mic) { mic.getTracks().forEach(function(t) {t.stop();}); mic = null; }
+    if (captureContext) { captureContext.close().catch(function(){}); captureContext = null; }
+    stopPlayback();
+    if (playbackContext) { playbackContext.close().catch(function(){}); playbackContext = null; }
+    transcriptNodes = {}; transcriptText = {}; muted = false; muteBtn.hidden = true;
+    talkBtn.textContent = 'Talk'; status.textContent = 'Voice ended'; busy(!!controller);
+  }
+  function stopAll() { if (controller) controller.abort(); stopVoice(); }
+
+  async function startVoice() {
+    if (isBusy || voiceConnecting) return;
+    if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
+      errorMsg('Voice needs HTTPS and a browser with microphone support. You can still type.'); return;
+    }
+    voiceConnecting = true; var epoch = ++voiceEpoch; busy(false); status.textContent = 'Starting voice…';
+    try {
+      // Initialize output on the click gesture for browser autoplay policies.
+      playbackContext = new (window.AudioContext || window.webkitAudioContext)(); await playbackContext.resume();
+      var stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+      if (epoch !== voiceEpoch) { stream.getTracks().forEach(function(t){t.stop();}); return; }
+      mic = stream;
+      if (!await warmUp()) throw new Error('Bot is unavailable. Wait for Render to start, or check Gemini configuration.');
+      if (epoch !== voiceEpoch) return;
+      captureContext = new (window.AudioContext || window.webkitAudioContext)();
+      await captureContext.audioWorklet.addModule(API + '/audio-worklet.js');
+      if (epoch !== voiceEpoch) return;
+      await captureContext.resume();
+      micSource = captureContext.createMediaStreamSource(mic);
+      captureNode = new AudioWorkletNode(captureContext, 'policy-pcm');
+      captureNode.port.onmessage = function(e) {
+        if (!muted && ws && ws.readyState === WebSocket.OPEN) {
+          if (ws.bufferedAmount > 65536) { errorMsg('Voice connection is too slow. Please reconnect.'); stopVoice(); return; }
+          var bytes = new Uint8Array(e.data), binary = '';
+          for (var i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
+          ws.send(JSON.stringify({type:'audio',data:btoa(binary)}));
+        }
+      };
+      var url = new URL(API + '/api/voice'); url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(url);
+      ws.onopen = function() { if (epoch === voiceEpoch) ws.send(JSON.stringify({type:'start',history:history.slice(-6)})); };
+      connectTimer = setTimeout(function(){ if (epoch === voiceEpoch) { errorMsg('Voice connection timed out. Check Gemini Live model access.'); stopVoice(); } }, 25000);
+      ws.onmessage = function(e) {
+        if (epoch !== voiceEpoch) return;
+        try {
+          var data = JSON.parse(e.data);
+          if (data.type === 'ready') {
+            clearTimeout(connectTimer); voiceConnecting = false;
+            micSource.connect(captureNode); captureNode.connect(captureContext.destination);
+            talkBtn.textContent = 'End'; muteBtn.hidden = false; busy(false); status.textContent = 'Listening';
+            pingTimer = setInterval(function(){ if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'})); },10000);
+          } else if (data.type === 'audio') {
+            playPCM(data); status.textContent = 'Speaking';
+          } else if (data.type === 'transcript') {
+            var role = data.role;
+            if (!transcriptNodes[role]) transcriptNodes[role] = addMsg('', role === 'assistant' ? 'bot' : 'user');
+            transcriptText[role] = (transcriptText[role] || '') + data.text;
+            transcriptNodes[role].textContent = transcriptText[role]; msgArea.scrollTop = msgArea.scrollHeight;
+          } else if (data.type === 'interrupted') {
+            stopPlayback(); finishTranscript(); status.textContent = 'Listening';
+          } else if (data.type === 'turn_complete') {
+            finishTranscript();
+            if (!audioQueue.size) status.textContent = muted ? 'Microphone muted' : 'Listening';
+          } else if (data.type === 'error') { errorMsg(data.error); stopVoice(); }
+        } catch (err) { errorMsg('Voice playback failed. You can continue by typing.'); stopVoice(); }
+      };
+      ws.onerror = function() { if (epoch === voiceEpoch) { errorMsg('Cannot connect to voice. Check the server and Gemini Live access.'); stopVoice(); } };
+      ws.onclose = function() { if (epoch === voiceEpoch) stopVoice(); };
+    } catch (err) {
+      if (epoch === voiceEpoch) { errorMsg(err.name === 'NotAllowedError' ? 'Microphone permission was denied. Allow it in browser settings, or type your question.' : err.message); stopVoice(); }
+    }
+  }
+  function finishTranscript() {
+    ['user','assistant'].forEach(function(role) { if (transcriptText[role]) history.push({role:role,content:transcriptText[role].slice(0,8000)}); });
+    history = history.slice(-6); transcriptNodes = {}; transcriptText = {};
+  }
+  function playPCM(data) {
+    if (!playbackContext) return;
+    var rateMatch = /rate=(\d+)/.exec(data.mime_type || ''); var rate = rateMatch ? Number(rateMatch[1]) : 24000;
+    var binary = atob(data.data), bytes = new Uint8Array(binary.length);
+    for (var i=0;i<binary.length;i++) bytes[i] = binary.charCodeAt(i);
+    if (bytes.length % 2) throw new Error('Invalid audio');
+    var view = new DataView(bytes.buffer), audio = playbackContext.createBuffer(1, bytes.length / 2, rate), values = audio.getChannelData(0);
+    for (var j=0;j<values.length;j++) values[j] = view.getInt16(j*2,true) / 32768;
+    var source = playbackContext.createBufferSource(); source.buffer = audio; source.connect(playbackContext.destination);
+    playbackAt = Math.max(playbackContext.currentTime + .02, playbackAt);
+    if (playbackAt - playbackContext.currentTime > 20) throw new Error('Audio queue overloaded');
+    audioQueue.add(source);
+    source.onended = function() { audioQueue.delete(source); source.disconnect(); if (!audioQueue.size && ws) status.textContent = muted ? 'Microphone muted' : 'Listening'; };
+    source.start(playbackAt); playbackAt += audio.duration;
+  }
+  window.addEventListener('pagehide', stopAll);
+  document.addEventListener('visibilitychange', function(){ if (document.hidden) stopAll(); });
 
   /* ── Markdown renderer (lightweight) ────────────────────────────── */
   function renderMarkdown(text) {
