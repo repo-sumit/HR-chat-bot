@@ -102,7 +102,7 @@
   var isOpen = false, isBusy = false, history = [], controller = null;          // isBusy: a typed question is being answered
   var ws = null, voiceConnecting = false, voiceReady = false, voiceEpoch = 0, voiceState = '', voiceTurns = 0;
   var mic = null, micSource = null, captureNode = null, captureContext = null, playbackContext = null;
-  var audioQueue = new Set(), playbackAt = 0, preBuffer = [], turnDone = false, speechOpen = false, level = 0;
+  var audioQueue = new Set(), playbackAt = 0, preBuffer = [], turnDone = false, answerDone = false, speechOpen = false, level = 0;
   var pingTimer = null, connectTimer = null, slowTimer = null, idleTimer = null, lastHeardAt = 0;
   var transcriptNodes = {}, transcriptText = {}, liveBubble = null, typingNode = null;
   addMsg(GREETING, 'bot');
@@ -231,7 +231,7 @@
     if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
       errorMsg('Voice needs HTTPS and a browser with microphone support. You can still type.'); return;
     }
-    var epoch = ++voiceEpoch; voiceConnecting = true; voiceReady = false; voiceTurns = 0; turnDone = false; preBuffer = [];
+    var epoch = ++voiceEpoch; voiceConnecting = true; voiceReady = false; voiceTurns = 0; turnDone = false; answerDone = false; preBuffer = [];
     setVoice('connecting', 'Getting ready…');
     try {
       // Create and resume audio inside the click gesture, as browser autoplay policies require.
@@ -311,7 +311,7 @@
           if (voiceState !== 'speaking') { if (!typingNode) typingNode = showTyping(); setVoice('thinking', 'Thinking…'); }
         }
       } else if (data.type === 'audio') {
-        removeTyping(); turnDone = false; clearTimeout(idleTimer); idleTimer = null;   // more audio arrived: not idle
+        removeTyping(); turnDone = false; answerDone = false; clearTimeout(idleTimer); idleTimer = null;   // more audio arrived: not idle
         if (voiceState !== 'speaking') setVoice('speaking', 'Speaking… talk to interrupt');
         playPCM(data);
       } else if (data.type === 'transcript') {
@@ -330,12 +330,12 @@
         transcriptText[role] = (transcriptText[role] || '') + String(data.text).replace(/\*/g, '');   // spoken text never needs markdown
         transcriptNodes[role].textContent = transcriptText[role].trim(); msgArea.scrollTop = msgArea.scrollHeight;
       } else if (data.type === 'interrupted') {
-        stopPlayback(); removeTyping(); finishTranscript(); turnDone = false; heardUser(); setVoice('listening', 'Listening…');
+        stopPlayback(); removeTyping(); answerDone = false; finishTranscript(); turnDone = false; heardUser(); setVoice('listening', 'Listening…');
       } else if (data.type === 'turn_complete') {
         removeTyping();
         if (!speechOpen && liveBubble && !transcriptText.user) dropLive();     // heard noise, no words
         if (transcriptText.assistant) voiceTurns++;
-        finishTranscript(); turnDone = true; maybeFollowUp();
+        answerDone = true; finishTranscript(); turnDone = true; maybeFollowUp();
       } else if (data.type === 'error') { errorMsg(data.error); stopVoice(); }
     } catch (err) { errorMsg('Voice playback failed. You can continue by typing.'); stopVoice(); }
   }
@@ -353,7 +353,7 @@
   function maybeFollowUp() {
     // Playback drained after the bot spoke (or the turn ended): the server's turn_complete can lag the audio, so don't wait for it.
     if (ws && voiceReady && !audioQueue.size && !speechOpen && (turnDone || voiceState === 'speaking')) {
-      setVoice('listening', 'Anything else? I’m listening'); armIdle(FOLLOW_UP_MS);
+      answerDone = true; setVoice('listening', 'Anything else? I’m listening'); armIdle(FOLLOW_UP_MS);
     }
   }
 
@@ -364,7 +364,12 @@
   function dropLive() { removeEl(liveBubble); liveBubble = null; }
   function removeTyping() { removeEl(typingNode); typingNode = null; }
   function finishTranscript() {
-    ['user','assistant'].forEach(function(role) { if (transcriptText[role]) history.push({role:role,content:transcriptText[role].trim().slice(0,8000)}); });
+    ['user','assistant'].forEach(function(role) {
+      var text = transcriptText[role] && transcriptText[role].trim(); if (!text) return;
+      // An answer cut short (stopped or talked over) is saved with "…": a bare half-sentence in history makes lighter models cut their next answer short too.
+      if (role === 'assistant' && !answerDone) text += ' …';
+      history.push({role:role,content:text.slice(0,8000)});
+    });
     history = history.slice(-6); transcriptNodes = {}; transcriptText = {};
   }
   function playPCM(data) {
