@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import numpy as np
 from google import genai
 from google.genai import types
@@ -53,7 +54,8 @@ PRECISION
 - For a broad question such as "tell me about the leave policy", give a 2-3 line overview and ask what they need.
 
 TONE
-- Sound like a kind, capable person. Notice how the user feels. If they are unwell, stressed, worried, grieving or frustrated, open with one short, genuine line of empathy (for example "Sorry you're not feeling well, hope you're better soon."), then help. Celebrate good news they actually share (a baby, a wedding) in one warm line. React only to feelings or news the user expressed; never assume them from the topic of the question.
+- Sound like a kind, capable person. Notice how the user feels. If they are unwell, stressed, worried, grieving or frustrated, open with one short, genuine line of empathy (for example "Sorry you're not feeling well, hope you're better soon."), then help. Celebrate good news they actually share (a baby, a wedding) in one warm line.
+- Sympathy or congratulations are only for what the user themselves say about how they feel or what happened to them ("I'm unwell", "my father passed away", "I'm expecting"). A plain policy question such as "How many weeks of maternity leave?" or "notice period kitna hai?" gets no sympathy or congratulations, just the answer.
 - Be warm without gushing. No filler such as "Great question!", no "As an AI", and no disclaimers or caveats the policy does not require (for example "this is not medical advice"). Use everyday words."""
 
 # Typed chat only: markdown formatting must never reach the voice model, which would echo it into transcripts.
@@ -118,17 +120,47 @@ async def embed_query(text):
             await asyncio.sleep(1)
 
 
+_ROMAN_HINDI = re.compile(r'\b(mujhe|mera|meri|mere|hai|hain|kya|kaise|kitna|kitni|kitne|nahi|nahin|chahiye|batao|bataiye|aap|aapko|aapka|'
+                          r'mein|liye|karna|karo|karein|milta|milti|milte|dena|padta|padti|lena|kab|kyun|toh|aur|bhi|sakta|sakti|sakte|hoga|hota|hoti)\b', re.I)
+
+
+def language_hint(text):
+    """Name the language of the user's latest message ('' when unsure).
+
+    Lighter models follow the language of earlier turns over a system-prompt rule, so the turn itself says it.
+    """
+    letters = [c for c in text if c.isalpha()]
+    if any(not (c.isascii() or 'ऀ' <= c <= 'ॿ') for c in letters):
+        return ''  # another script: let the model decide
+    if any('ऀ' <= c <= 'ॿ' for c in letters):
+        return 'Hindi (Devanagari script)'
+    if len(_ROMAN_HINDI.findall(text)) >= 2:
+        return 'Hinglish (Hindi written in Roman letters)'
+    return 'English' if len(text.split()) > 2 else ''  # "ok thanks" keeps the conversation's language
+
+
 def _build_contents(query, history=None):
     contents = [types.Content(role='user' if turn['role'] == 'user' else 'model', parts=[types.Part.from_text(text=turn['content'])]) for turn in (history or [])[-6:]]
-    contents.append(types.Content(role='user', parts=[types.Part.from_text(text=query)]))
+    parts = [types.Part.from_text(text=query)]
+    hint = language_hint(query)
+    if hint:
+        parts.append(types.Part.from_text(text=f'[Reply in {hint}: the language of the message above, whatever language earlier turns used.]'))
+    contents.append(types.Content(role='user', parts=parts))
     return contents
+
+
+def _language_rule(query):
+    hint = language_hint(query)
+    return (f"\n\nFINAL RULE: write your whole answer in {hint}, the language of the user's last message, "
+            "even though earlier turns may be in another language.") if hint else ''
 
 
 async def generate_response(query, chunks, history=None):
     context = '\n\n'.join(c['text'] for c in chunks)
     stream = await get_client().aio.models.generate_content_stream(
         model=config.GEMINI_MODEL, contents=_build_contents(query, history),
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT + '\n\n' + TEXT_PROMPT + '\n\nPOLICY_CONTEXT:\n' + context,
+        # The language rule goes after the policy text: lighter models weigh the end of the system prompt most.
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT + '\n\n' + TEXT_PROMPT + '\n\nPOLICY_CONTEXT:\n' + context + _language_rule(query),
                                          temperature=config.TEMPERATURE, max_output_tokens=2048))
     emitted = False
     async for event in stream:

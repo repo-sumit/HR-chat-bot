@@ -134,7 +134,7 @@ The offline tests simulate Google responses; they cannot certify credentials, ac
 | Variable | Default | Purpose |
 |---|---|---|
 | `GEMINI_API_KEY` | Required | Server-side API key |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Streaming text model |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Streaming text model. Check this value on the host: an env var overrides the default, and `*-flash-lite` models are noticeably weaker at Hindi/Hinglish and at following the reply-language rule (tested: `gemini-2.5-flash-lite` answers Hinglish questions in English). |
 | `GEMINI_LIVE_MODEL` | `gemini-3.8-live` | Native audio Live model |
 | `GEMINI_VOICE` | `Kore` | Live prebuilt voice |
 | `EMBEDDING_MODEL` | `gemini-embedding-001` | Must match the committed policy index |

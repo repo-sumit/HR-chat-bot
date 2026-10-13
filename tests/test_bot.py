@@ -201,6 +201,25 @@ def test_voice_invalid_frame_closes_without_leaking_details(client,monkeypatch):
     assert main._voice_connections == 0
 
 
+@pytest.mark.parametrize('text,expected', [
+    ('और maternity leave कितनी मिलती है?', 'Devanagari'),
+    ('Mujhe notice period kitna dena padta hai?', 'Hinglish'),
+    ('How many sick leaves do I get?', 'English'),
+    ('ok thanks', ''),          # short acknowledgement: keep the conversation's language
+    ('தமிழ் கேள்வி', ''),        # unsupported script: let the model decide
+])
+def test_language_hint_names_the_latest_message_language(text, expected):
+    hint = rag.language_hint(text)
+    assert (expected in hint) if expected else hint == ''
+
+
+def test_language_hint_is_added_to_the_latest_turn_only():
+    contents = rag._build_contents('और leave?', [{'role':'user','content':'Hi'},{'role':'assistant','content':'Hello'}])
+    assert [len(c.parts) for c in contents[:-1]] == [1, 1]
+    assert contents[-1].parts[0].text == 'और leave?'
+    assert 'Devanagari' in contents[-1].parts[1].text and 'earlier turns' in contents[-1].parts[1].text
+
+
 @pytest.mark.asyncio
 async def test_gemini_stream_uses_async_api_and_grounding(monkeypatch):
     captured = {}
@@ -214,3 +233,21 @@ async def test_gemini_stream_uses_async_api_and_grounding(monkeypatch):
     assert 'Approved policy' in captured['config'].system_instruction
     assert captured['contents'][0].role == 'model'
     assert captured['contents'][-1].parts[0].text == 'question'
+
+
+@pytest.mark.asyncio
+async def test_language_rule_is_repeated_after_the_policy_text(monkeypatch):
+    # Lighter models heed the end of the system prompt over earlier turns, so the rule goes after the long context.
+    captured = {}
+    async def stream(**kwargs):
+        captured.update(kwargs)
+        async def chunks():
+            yield types.GenerateContentResponse(candidates=[types.Candidate(content=types.Content(parts=[types.Part(text='जवाब')]))])
+        return chunks()
+    monkeypatch.setattr(rag,'get_client',lambda:NS(aio=NS(models=NS(generate_content_stream=stream))))
+    [_ async for _ in rag.generate_response('और maternity leave कितनी मिलती है?',[{'text':'Approved policy'}],[{'role':'assistant','content':'English answer'}])]
+    instruction = captured['config'].system_instruction
+    assert instruction.index('Approved policy') < instruction.index('FINAL RULE')
+    assert instruction.rstrip().endswith('even though earlier turns may be in another language.') and 'Devanagari' in instruction.split('FINAL RULE')[1]
+    [_ async for _ in rag.generate_response('ok',[{'text':'Approved policy'}],[])]
+    assert 'FINAL RULE' not in captured['config'].system_instruction   # nothing to say about a bare acknowledgement
