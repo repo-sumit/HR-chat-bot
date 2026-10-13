@@ -9,6 +9,12 @@
   var ACCENT = script?.getAttribute("data-accent-color") || "#2D2B7F";
   var POS = script?.getAttribute("data-position") || "bottom-right";
 
+  /* Voice timing: tweak these to change how hands-free it feels. */
+  var NO_SPEECH_MS = 8000;     // nothing said after tapping the mic: end by itself
+  var FOLLOW_UP_MS = 6000;     // quiet time after an answer before voice ends by itself (0-ish = one question per tap)
+  var PREBUFFER_FRAMES = 25;   // 100 ms each: speech said before the connection is ready is kept, not lost
+  var IDLE_HINT = "Ask about a policy or tap the mic…";
+
   /* ── Inject scoped CSS ─────────────────────────────────────────── */
   var TEAL = "#5BC5C8";
   var css = `
@@ -37,20 +43,35 @@
     .psb-bot h1,.psb-bot h2,.psb-bot h3{color:${ACCENT};font-weight:600;margin:8px 0 4px}
     .psb-bot h1{font-size:16px} .psb-bot h2{font-size:15px} .psb-bot h3{font-size:14px}
     .psb-user{background:${ACCENT};color:#fff;align-self:flex-end;border-bottom-right-radius:4px;box-shadow:0 2px 8px rgba(45,43,127,.15)}
+    .psb-note{align-self:center;font-size:12px;color:#9ca3af;text-align:center;padding:0 8px}
     .psb-typing{align-self:flex-start;display:flex;gap:5px;padding:10px 14px;background:#fff;border-radius:14px;border-bottom-left-radius:4px;border:1px solid #ececf4}
     .psb-dot{width:8px;height:8px;background:#c5c5d6;border-radius:50%;animation:psb-bounce .6s infinite alternate}
     .psb-dot:nth-child(2){animation-delay:.15s}
     .psb-dot:nth-child(3){animation-delay:.3s}
     @keyframes psb-bounce{to{transform:translateY(-6px);background:${TEAL}}}
-    .psb-input-bar{display:flex;padding:12px 14px;border-top:1px solid #ececf4;gap:6px;flex-shrink:0;background:#fff;align-items:flex-end}
-    .psb-input{min-width:0;flex:1;border:1px solid #dddde8;border-radius:12px;padding:9px 14px;font-size:14px;outline:none;resize:none;font-family:'Inter',system-ui,sans-serif;max-height:80px;background:#f7f8fc;transition:border-color .2s,background .2s}
+    /* Listening bubble: bars follow the real microphone level (--lvl is 0..1, set from JS). */
+    .psb-live{display:flex;align-items:center;justify-content:center;gap:3px;min-width:68px;min-height:20px}
+    .psb-live i{display:block;width:3px;border-radius:2px;background:#fff;opacity:.92;height:calc(5px + var(--lvl,0) * 14px * var(--k,1));transition:height .1s linear}
+    .psb-live i:nth-child(1){--k:.55} .psb-live i:nth-child(2){--k:.85} .psb-live i:nth-child(3){--k:1} .psb-live i:nth-child(4){--k:.8} .psb-live i:nth-child(5){--k:.5}
+    .psb-input-bar{display:flex;padding:12px 14px 6px;border-top:1px solid #ececf4;gap:8px;flex-shrink:0;background:#fff;align-items:flex-end}
+    .psb-input{min-width:0;flex:1;box-sizing:border-box;min-height:42px;border:1px solid #dddde8;border-radius:21px;padding:9px 16px;font-size:14px;outline:none;resize:none;font-family:'Inter',system-ui,sans-serif;max-height:80px;background:#f7f8fc;transition:border-color .2s,background .2s}
     .psb-input:focus{border-color:${TEAL};background:#fff}
-    .psb-send{background:${ACCENT};color:#fff;border:none;border-radius:12px;padding:9px 16px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;letter-spacing:0.2px;transition:background .15s,transform .1s;height:38px}
-    .psb-send:hover{background:#3d3ba0}
-    .psb-send:active{transform:scale(.97)}
-    .psb-send:disabled{opacity:.45;cursor:default;transform:none}
+    .psb-window[data-voice] .psb-input::placeholder{color:${ACCENT};opacity:.75}
+    /* One button: mic (empty box) → send (text typed) → stop (voice or answer running). */
+    .psb-action{position:relative;flex-shrink:0;width:42px;height:42px;border:none;border-radius:50%;background:${ACCENT};color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;transition:background .15s,transform .1s}
+    .psb-action:hover{background:#3d3ba0}
+    .psb-action:active{transform:scale(.94)}
+    .psb-action svg{width:20px;height:20px;fill:currentColor;display:none}
+    .psb-action[data-mode=mic] .psb-i-mic,.psb-action[data-mode=send] .psb-i-send,.psb-action[data-mode=stop] .psb-i-stop{display:block}
+    .psb-action::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:2px solid ${TEAL};opacity:0;pointer-events:none;transition:transform .12s linear,opacity .2s}
+    .psb-window[data-voice=connecting] .psb-action::after,.psb-window[data-voice=listening] .psb-action::after{opacity:.9;transform:scale(calc(1 + var(--lvl,0) * .4))}
+    .psb-window[data-voice=thinking] .psb-action::after{opacity:.5;animation:psb-breathe 1s ease-in-out infinite}
+    .psb-window[data-voice=speaking] .psb-action::after{opacity:.9;animation:psb-breathe 1.4s ease-in-out infinite}
+    @keyframes psb-breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.18)}}
+    .psb-action:focus-visible,.psb-close:focus-visible{outline:3px solid ${TEAL};outline-offset:3px}
     .psb-footer{text-align:center;font-size:11px;color:#9ca3af;padding:6px 0 10px;flex-shrink:0;background:#fff}
-    .psb-sources{font-size:11px;color:${TEAL};margin-top:6px;font-weight:500}
+    .psb-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+    @media(prefers-reduced-motion:reduce){.psb-window .psb-action::after,.psb-dot{animation:none}}
     @media(max-width:480px){
       .psb-window{width:100vw;height:100dvh;bottom:0;${POS==="bottom-left"?"left":"right"}:0;border-radius:0}
       .psb-bubble{bottom:12px;${POS==="bottom-left"?"left":"right"}:12px}
@@ -61,9 +82,9 @@
   style.textContent = css;
   document.head.appendChild(style);
 
-  var voiceStyle = document.createElement("style");
-  voiceStyle.textContent = ".psb-tools{display:flex;align-items:center;gap:8px;padding:9px 14px;background:#fff;border-top:1px solid #ececf4}.psb-tools button{border:1px solid #dddde8;border-radius:8px;background:#fff;padding:6px 10px;color:#2D2B7F;cursor:pointer}.psb-tools button:disabled{opacity:.5;cursor:default}.psb-status{font-size:12px;color:#666;flex:1}.psb-tools button:focus-visible,.psb-send:focus-visible,.psb-close:focus-visible{outline:3px solid #5BC5C8;outline-offset:2px}";
-  document.head.appendChild(voiceStyle);
+  var ICONS = '<svg class="psb-i-mic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2z"/></svg>' +
+    '<svg class="psb-i-send" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2z"/></svg>' +
+    '<svg class="psb-i-stop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2.5"/></svg>';
   var wrap = document.createElement('div'); wrap.className = 'psb-wrap';
   var bubble = document.createElement('button'); bubble.className = 'psb-bubble';
   bubble.textContent = 'Chat'; bubble.setAttribute('aria-label', 'Open HR policy chat');
@@ -71,33 +92,45 @@
   win.inert = true; win.setAttribute('role', 'dialog'); win.setAttribute('aria-label', BOT); win.setAttribute('aria-hidden', 'true');
   win.innerHTML = '<div class="psb-header"><span>' + esc(BOT) + '</span><button class="psb-close" aria-label="Close chat">×</button></div>' +
     '<div class="psb-messages" role="log" aria-live="polite" aria-relevant="additions"></div>' +
-    '<div class="psb-tools"><button class="psb-talk">Talk</button><button class="psb-mute" hidden>Mute</button><button class="psb-stop" disabled>Stop</button><span class="psb-status" role="status">Type or talk</span></div>' +
-    '<div class="psb-input-bar"><textarea class="psb-input" aria-label="Your policy question" placeholder="Ask about a policy…" rows="1" maxlength="4000"></textarea><button class="psb-send">Ask</button></div>' +
+    '<div class="psb-input-bar"><textarea class="psb-input" aria-label="Your policy question" placeholder="' + IDLE_HINT + '" rows="1" maxlength="4000"></textarea>' +
+    '<button class="psb-action" type="button" data-mode="mic" aria-label="Talk to the assistant">' + ICONS + '</button></div>' +
+    '<span class="psb-sr" role="status" aria-live="polite"></span>' +
     '<div class="psb-footer">Chats stay in this page. Audio is processed by Gemini.</div>';
   wrap.append(win, bubble); document.body.appendChild(wrap);
   var msgArea = win.querySelector('.psb-messages'), input = win.querySelector('.psb-input');
-  var sendBtn = win.querySelector('.psb-send'), closeBtn = win.querySelector('.psb-close');
-  var talkBtn = win.querySelector('.psb-talk'), muteBtn = win.querySelector('.psb-mute');
-  var stopBtn = win.querySelector('.psb-stop'), status = win.querySelector('.psb-status');
-  var isOpen = false, isBusy = false, history = [], controller = null;
-  var ws = null, mic = null, captureContext = null, playbackContext = null, captureNode = null;
-  var micSource = null, audioQueue = new Set(), playbackAt = 0, muted = false;
-  var voiceConnecting = false, voiceEpoch = 0, pingTimer = null, connectTimer = null;
-  var transcriptNodes = {}, transcriptText = {}, lastAudioAt = 0;
+  var actionBtn = win.querySelector('.psb-action'), closeBtn = win.querySelector('.psb-close'), srStatus = win.querySelector('.psb-sr');
+  var isOpen = false, isBusy = false, history = [], controller = null;          // isBusy: a typed question is being answered
+  var ws = null, voiceConnecting = false, voiceReady = false, voiceEpoch = 0, voiceState = '', voiceTurns = 0;
+  var mic = null, micSource = null, captureNode = null, captureContext = null, playbackContext = null;
+  var audioQueue = new Set(), playbackAt = 0, preBuffer = [], turnDone = false, speechOpen = false, level = 0;
+  var pingTimer = null, connectTimer = null, slowTimer = null, idleTimer = null, lastHeardAt = 0;
+  var transcriptNodes = {}, transcriptText = {}, liveBubble = null, typingNode = null;
   addMsg(GREETING, 'bot');
 
-  function busy(value) {
-    isBusy = value; sendBtn.disabled = value || !!ws || voiceConnecting;
-    talkBtn.disabled = value || voiceConnecting;
-    input.disabled = !!ws || voiceConnecting;
-    stopBtn.disabled = !value && !ws && !voiceConnecting;
+  /* ── One-button UI ─────────────────────────────────────────────── */
+  function render() {
+    var voiceOn = !!ws || voiceConnecting;
+    var mode = voiceOn || isBusy ? 'stop' : input.value.trim() ? 'send' : 'mic';
+    actionBtn.setAttribute('data-mode', mode);
+    actionBtn.setAttribute('aria-label', voiceOn ? 'Stop voice' : isBusy ? 'Stop answer' : mode === 'send' ? 'Send message' : 'Talk to the assistant');
   }
+  function setVoice(state, text) {
+    voiceState = state;
+    if (state) win.setAttribute('data-voice', state); else win.removeAttribute('data-voice');
+    input.placeholder = text || IDLE_HINT; srStatus.textContent = text || '';
+    render();
+  }
+  function setBusy(value) { isBusy = value; render(); }
+
   async function warmUp() {
+    if (!ws && !voiceConnecting) input.placeholder = 'Waking up the assistant…';
+    var ok = false;
     try {
       var response = await fetch(API + '/readyz', {signal: AbortSignal.timeout(65000)});
-      if (!response.ok) throw new Error('Bot is not ready. Check Gemini settings or wait for the server to start.');
-      return true;
-    } catch (err) { if (!isBusy && !ws) status.textContent = 'Server starting or unavailable'; return false; }
+      ok = response.ok;
+    } catch (err) { ok = false; }
+    if (!ws && !voiceConnecting) input.placeholder = ok ? IDLE_HINT : 'Assistant is starting… try again shortly';
+    return ok;
   }
   warmUp();
   bubble.onclick = function () {
@@ -111,26 +144,28 @@
     bubble.classList.remove('psb-hidden'); bubble.focus();
   };
   win.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeBtn.click(); });
-  sendBtn.onclick = send;
-  input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
-  input.addEventListener('input', function() { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight,80) + 'px'; });
-  stopBtn.onclick = stopAll;
-  talkBtn.onclick = function() { if (ws) stopVoice(); else startVoice(); };
-  muteBtn.onclick = function() {
-    muted = !muted;
-    if (mic) mic.getAudioTracks().forEach(function(track) { track.enabled = !muted; });
-    if (muted && ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'end_audio'}));
-    muteBtn.textContent = muted ? 'Unmute' : 'Mute'; muteBtn.setAttribute('aria-pressed', String(muted));
-    status.textContent = muted ? 'Microphone muted' : 'Listening';
+  actionBtn.onclick = function () {
+    if (ws || voiceConnecting) stopVoice();
+    else if (isBusy) { if (controller) controller.abort(); }
+    else if (input.value.trim()) send();
+    else startVoice();
   };
+  input.addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+  input.addEventListener('input', function() {
+    this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 80) + 'px';
+    if (ws || voiceConnecting) stopVoice();   // typing means "let me type": hand the box back
+    render();
+  });
 
+  /* ── Typed chat ────────────────────────────────────────────────── */
   async function send() {
-    var text = input.value.trim(); if (!text || isBusy || ws || voiceConnecting) return;
+    var text = input.value.trim(); if (!text || isBusy) return;
+    if (ws || voiceConnecting) stopVoice();
     var prior = history.slice(-6); addMsg(text, 'user'); input.value = ''; input.style.height = 'auto';
-    busy(true); status.textContent = 'Thinking…';
-    var typing = showTyping(), botDiv = null, fullText = '', completed = false;
+    setBusy(true);
+    var typing = showTyping(), botDiv = null, fullText = '', completed = false, timedOut = false;
     var ownController = new AbortController(); controller = ownController;
-    var timer = setTimeout(function() { ownController.abort(); }, 90000);
+    var timer = setTimeout(function() { timedOut = true; ownController.abort(); }, 90000);
     var reader;
     try {
       var res = await fetch(API + '/api/chat', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -156,100 +191,180 @@
       }
       if (!fullText.trim()) throw new Error('No answer received. Please try again.');
       history = prior.concat([{role:'user',content:text},{role:'assistant',content:fullText.slice(0,8000)}]).slice(-6);
-      status.textContent = 'Ready';
     } catch (err) {
-      if (botDiv) { var note = document.createElement('div'); note.textContent = 'Incomplete response'; botDiv.appendChild(note); }
-      if (err.name !== 'AbortError') errorMsg(err.message);
-      status.textContent = err.name === 'AbortError' ? 'Stopped or timed out' : 'Could not answer';
+      if (botDiv) { var incomplete = document.createElement('div'); incomplete.textContent = 'Incomplete response'; botDiv.appendChild(incomplete); }
+      if (err.name !== 'AbortError') errorMsg(friendlyNetworkError(err));
+      else if (timedOut) errorMsg('The answer took too long. Please try again.');
     } finally {
       clearTimeout(timer); if (reader) { try { await reader.cancel(); } catch (_) {} }
-      removeEl(typing); if (controller === ownController) { controller = null; busy(false); }
+      removeEl(typing); if (controller === ownController) { controller = null; setBusy(false); }
     }
   }
 
+  /* ── Voice: tap once, talk, it answers, listens briefly for a follow-up, then ends by itself ── */
   function stopPlayback() {
     audioQueue.forEach(function(source) { try { source.stop(); } catch (_) {} }); audioQueue.clear();
     playbackAt = playbackContext ? playbackContext.currentTime : 0;
   }
-  function stopVoice() {
-    voiceEpoch++; voiceConnecting = false;
-    clearInterval(pingTimer); clearTimeout(connectTimer); pingTimer = connectTimer = null;
-    if (ws) { ws.onclose = null; ws.close(); ws = null; }
-    if (captureNode) { captureNode.disconnect(); captureNode = null; }
+  function stopVoice(noteText) {
+    var wasOn = !!ws || voiceConnecting;
+    voiceEpoch++; voiceConnecting = false; voiceReady = false;
+    clearInterval(pingTimer); clearTimeout(connectTimer); clearTimeout(slowTimer); clearTimeout(idleTimer);
+    pingTimer = connectTimer = slowTimer = idleTimer = null;
+    if (ws) { ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null; try { ws.close(); } catch (_) {} ws = null; }
+    if (captureNode) { captureNode.port.onmessage = null; captureNode.disconnect(); captureNode = null; }
     if (micSource) { micSource.disconnect(); micSource = null; }
     if (mic) { mic.getTracks().forEach(function(t) {t.stop();}); mic = null; }
     if (captureContext) { captureContext.close().catch(function(){}); captureContext = null; }
     stopPlayback();
     if (playbackContext) { playbackContext.close().catch(function(){}); playbackContext = null; }
-    transcriptNodes = {}; transcriptText = {}; muted = false; muteBtn.hidden = true;
-    talkBtn.textContent = 'Talk'; status.textContent = 'Voice ended'; busy(!!controller);
+    playbackAt = 0;   // each session has its own audio clock; a stale value makes the next session's audio late or "overloaded"
+    finishTranscript(); removeTyping(); dropLive();
+    preBuffer = []; turnDone = false; speechOpen = false; level = 0; win.style.removeProperty('--lvl');
+    setVoice('');
+    if (wasOn && noteText) note(noteText);
   }
   function stopAll() { if (controller) controller.abort(); stopVoice(); }
 
   async function startVoice() {
-    if (isBusy || voiceConnecting) return;
+    if (isBusy || voiceConnecting || ws) return;
     if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.AudioWorkletNode) {
       errorMsg('Voice needs HTTPS and a browser with microphone support. You can still type.'); return;
     }
-    voiceConnecting = true; var epoch = ++voiceEpoch; busy(false); status.textContent = 'Starting voice…';
+    var epoch = ++voiceEpoch; voiceConnecting = true; voiceReady = false; voiceTurns = 0; turnDone = false; preBuffer = [];
+    setVoice('connecting', 'Getting ready…');
     try {
-      // Initialize output on the click gesture for browser autoplay policies.
-      playbackContext = new (window.AudioContext || window.webkitAudioContext)(); await playbackContext.resume();
+      // Create and resume audio inside the click gesture, as browser autoplay policies require.
+      var Ctx = window.AudioContext || window.webkitAudioContext;
+      playbackContext = new Ctx(); captureContext = new Ctx();
+      playbackContext.resume(); captureContext.resume();
       var stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
       if (epoch !== voiceEpoch) { stream.getTracks().forEach(function(t){t.stop();}); return; }
       mic = stream;
-      if (!await warmUp()) throw new Error('Bot is unavailable. Wait for Render to start, or check Gemini configuration.');
-      if (epoch !== voiceEpoch) return;
-      captureContext = new (window.AudioContext || window.webkitAudioContext)();
+      // Connect to the server while the audio worklet loads; speech said before "ready" is buffered, not lost.
+      openSocket(epoch);
       await captureContext.audioWorklet.addModule(API + '/audio-worklet.js');
       if (epoch !== voiceEpoch) return;
       await captureContext.resume();
+      if (epoch !== voiceEpoch) return;
       micSource = captureContext.createMediaStreamSource(mic);
       captureNode = new AudioWorkletNode(captureContext, 'policy-pcm');
-      captureNode.port.onmessage = function(e) {
-        if (!muted && ws && ws.readyState === WebSocket.OPEN) {
-          if (ws.bufferedAmount > 65536) { errorMsg('Voice connection is too slow. Please reconnect.'); stopVoice(); return; }
-          var bytes = new Uint8Array(e.data), binary = '';
-          for (var i=0;i<bytes.length;i++) binary += String.fromCharCode(bytes[i]);
-          ws.send(JSON.stringify({type:'audio',data:btoa(binary)}));
-        }
-      };
-      var url = new URL(API + '/api/voice'); url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(url);
-      ws.onopen = function() { if (epoch === voiceEpoch) ws.send(JSON.stringify({type:'start',history:history.slice(-6)})); };
-      connectTimer = setTimeout(function(){ if (epoch === voiceEpoch) { errorMsg('Voice connection timed out. Check Gemini Live model access.'); stopVoice(); } }, 25000);
-      ws.onmessage = function(e) {
-        if (epoch !== voiceEpoch) return;
-        try {
-          var data = JSON.parse(e.data);
-          if (data.type === 'ready') {
-            clearTimeout(connectTimer); voiceConnecting = false;
-            micSource.connect(captureNode); captureNode.connect(captureContext.destination);
-            talkBtn.textContent = 'End'; muteBtn.hidden = false; busy(false); status.textContent = 'Listening';
-            pingTimer = setInterval(function(){ if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'})); },10000);
-          } else if (data.type === 'audio') {
-            playPCM(data); status.textContent = 'Speaking';
-          } else if (data.type === 'transcript') {
-            var role = data.role;
-            if (!transcriptNodes[role]) transcriptNodes[role] = addMsg('', role === 'assistant' ? 'bot' : 'user');
-            transcriptText[role] = (transcriptText[role] || '') + data.text;
-            transcriptNodes[role].textContent = transcriptText[role]; msgArea.scrollTop = msgArea.scrollHeight;
-          } else if (data.type === 'interrupted') {
-            stopPlayback(); finishTranscript(); status.textContent = 'Listening';
-          } else if (data.type === 'turn_complete') {
-            finishTranscript();
-            if (!audioQueue.size) status.textContent = muted ? 'Microphone muted' : 'Listening';
-          } else if (data.type === 'error') { errorMsg(data.error); stopVoice(); }
-        } catch (err) { errorMsg('Voice playback failed. You can continue by typing.'); stopVoice(); }
-      };
-      ws.onerror = function() { if (epoch === voiceEpoch) { errorMsg('Cannot connect to voice. Check the server and Gemini Live access.'); stopVoice(); } };
-      ws.onclose = function() { if (epoch === voiceEpoch) stopVoice(); };
+      captureNode.port.onmessage = onMicFrame;
+      micSource.connect(captureNode); captureNode.connect(captureContext.destination);
     } catch (err) {
       if (epoch === voiceEpoch) { errorMsg(err.name === 'NotAllowedError' ? 'Microphone permission was denied. Allow it in browser settings, or type your question.' : err.message); stopVoice(); }
     }
   }
+  function openSocket(epoch) {
+    var url = new URL(API + '/api/voice'); url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(url);
+    ws.onopen = function() { ws.send(JSON.stringify({type:'start',history:history.slice(-6)})); };
+    ws.onmessage = onVoiceMessage;
+    ws.onerror = function() { errorMsg('Cannot connect to voice. Check the server and Gemini Live access.'); stopVoice(); };
+    ws.onclose = function() {
+      if (!voiceReady) { errorMsg('Voice is unavailable or busy right now. You can still type your question.'); stopVoice(); }
+      else stopVoice('Voice ended. Tap the mic to talk again.');
+    };
+    slowTimer = setTimeout(function() { if (epoch === voiceEpoch && voiceConnecting) setVoice('connecting', 'Still connecting… the server may be waking up'); }, 3500);
+    connectTimer = setTimeout(function() { if (epoch === voiceEpoch && voiceConnecting) { errorMsg('Voice connection timed out. Please try again.'); stopVoice(); } }, 40000);
+  }
+
+  function onMicFrame(e) {
+    var pcm = new Int16Array(e.data), sum = 0;
+    for (var i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+    level = Math.max(Math.min(1, Math.sqrt(sum / pcm.length) / 32768 * 9), level * 0.65);
+    win.style.setProperty('--lvl', level.toFixed(2));          // drives the ring and the listening bars
+    if (!ws) return;
+    if (!voiceReady) { preBuffer.push(e.data); if (preBuffer.length > PREBUFFER_FRAMES) preBuffer.shift(); return; }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > 262144) { errorMsg('Voice connection is too slow. Please reconnect.'); stopVoice(); return; }
+    sendPCM(new Uint8Array(e.data));
+  }
+  function sendPCM(bytes) {
+    var binary = '';
+    for (var i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    ws.send(JSON.stringify({type:'audio',data:btoa(binary)}));
+  }
+  function flushPreBuffer() {
+    // Merge buffered 100 ms frames into <=0.5 s messages so the server's frame-rate limit is respected.
+    for (var i = 0; i < preBuffer.length; i += 5) {
+      var group = preBuffer.slice(i, i + 5), bytes = new Uint8Array(group.length * 3200);
+      group.forEach(function(frame, j) { bytes.set(new Uint8Array(frame), j * 3200); });
+      sendPCM(bytes);
+    }
+    preBuffer = [];
+  }
+
+  function onVoiceMessage(e) {
+    var data;
+    try { data = JSON.parse(e.data); } catch (_) { return; }
+    try {
+      if (data.type === 'ready') {
+        clearTimeout(connectTimer); clearTimeout(slowTimer); voiceConnecting = false; voiceReady = true;
+        pingTimer = setInterval(function(){ if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'ping'})); }, 10000);
+        flushPreBuffer(); showLive(); setVoice('listening', 'Listening… go ahead'); armIdle(NO_SPEECH_MS);
+      } else if (data.type === 'speech') {
+        if (data.state === 'start') {
+          speechOpen = true; turnDone = false; heardUser(); showLive(); setVoice('listening', 'Listening…');
+        } else {
+          speechOpen = false; heardUser();
+          if (voiceState !== 'speaking') { if (!typingNode) typingNode = showTyping(); setVoice('thinking', 'Thinking…'); }
+        }
+      } else if (data.type === 'audio') {
+        removeTyping(); turnDone = false; clearTimeout(idleTimer); idleTimer = null;   // more audio arrived: not idle
+        if (voiceState !== 'speaking') setVoice('speaking', 'Speaking… talk to interrupt');
+        playPCM(data);
+      } else if (data.type === 'transcript') {
+        var role = data.role === 'assistant' ? 'assistant' : 'user';
+        if (role === 'user') {
+          heardUser();
+          if (!transcriptNodes.user) {
+            var node = liveBubble || addMsg('', 'user'); liveBubble = null;
+            if (transcriptNodes.assistant) msgArea.insertBefore(node, transcriptNodes.assistant);   // keep question above answer
+            node.classList.remove('psb-live'); node.textContent = ''; transcriptNodes.user = node;
+          }
+        } else {
+          removeTyping();
+          if (!transcriptNodes.assistant) transcriptNodes.assistant = addMsg('', 'bot');
+        }
+        transcriptText[role] = (transcriptText[role] || '') + String(data.text).replace(/\*/g, '');   // spoken text never needs markdown
+        transcriptNodes[role].textContent = transcriptText[role].trim(); msgArea.scrollTop = msgArea.scrollHeight;
+      } else if (data.type === 'interrupted') {
+        stopPlayback(); removeTyping(); finishTranscript(); turnDone = false; heardUser(); setVoice('listening', 'Listening…');
+      } else if (data.type === 'turn_complete') {
+        removeTyping();
+        if (!speechOpen && liveBubble && !transcriptText.user) dropLive();     // heard noise, no words
+        if (transcriptText.assistant) voiceTurns++;
+        finishTranscript(); turnDone = true; maybeFollowUp();
+      } else if (data.type === 'error') { errorMsg(data.error); stopVoice(); }
+    } catch (err) { errorMsg('Voice playback failed. You can continue by typing.'); stopVoice(); }
+  }
+
+  /* Auto-end: server speech events cancel the timer; it is re-armed after each finished answer. */
+  function heardUser() { lastHeardAt = Date.now(); clearTimeout(idleTimer); idleTimer = null; }
+  function armIdle(ms) {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function() {
+      idleTimer = null; if (!ws) return;
+      if (Date.now() - lastHeardAt < 1500) return armIdle(1500);               // someone just spoke: give it a moment
+      stopVoice(voiceTurns ? 'Tap the mic to ask another question.' : 'I didn’t hear anything. Tap the mic to try again.');
+    }, ms);
+  }
+  function maybeFollowUp() {
+    // Playback drained after the bot spoke (or the turn ended): the server's turn_complete can lag the audio, so don't wait for it.
+    if (ws && voiceReady && !audioQueue.size && !speechOpen && (turnDone || voiceState === 'speaking')) {
+      setVoice('listening', 'Anything else? I’m listening'); armIdle(FOLLOW_UP_MS);
+    }
+  }
+
+  function showLive() {
+    if (liveBubble || transcriptNodes.user) return;
+    liveBubble = addMsg('', 'user'); liveBubble.classList.add('psb-live'); liveBubble.innerHTML = '<i></i><i></i><i></i><i></i><i></i>';
+  }
+  function dropLive() { removeEl(liveBubble); liveBubble = null; }
+  function removeTyping() { removeEl(typingNode); typingNode = null; }
   function finishTranscript() {
-    ['user','assistant'].forEach(function(role) { if (transcriptText[role]) history.push({role:role,content:transcriptText[role].slice(0,8000)}); });
+    ['user','assistant'].forEach(function(role) { if (transcriptText[role]) history.push({role:role,content:transcriptText[role].trim().slice(0,8000)}); });
     history = history.slice(-6); transcriptNodes = {}; transcriptText = {};
   }
   function playPCM(data) {
@@ -264,7 +379,8 @@
     playbackAt = Math.max(playbackContext.currentTime + .02, playbackAt);
     if (playbackAt - playbackContext.currentTime > 20) throw new Error('Audio queue overloaded');
     audioQueue.add(source);
-    source.onended = function() { audioQueue.delete(source); source.disconnect(); if (!audioQueue.size && ws) status.textContent = muted ? 'Microphone muted' : 'Listening'; };
+    // Grace period: audio arrives in bursts and the queue can run dry between chunks mid-answer.
+    source.onended = function() { audioQueue.delete(source); source.disconnect(); if (!audioQueue.size) setTimeout(maybeFollowUp, 500); };
     source.start(playbackAt); playbackAt += audio.duration;
   }
   window.addEventListener('pagehide', stopAll);
@@ -314,6 +430,14 @@
     msgArea.appendChild(div);
     msgArea.scrollTop = msgArea.scrollHeight;
     return div;
+  }
+
+  function note(text) {
+    var div = document.createElement("div");
+    div.className = "psb-note";
+    div.textContent = text;
+    msgArea.appendChild(div);
+    msgArea.scrollTop = msgArea.scrollHeight;
   }
 
   function removeEl(el) { if (el && el.parentNode) el.parentNode.removeChild(el); }

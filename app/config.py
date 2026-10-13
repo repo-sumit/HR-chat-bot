@@ -16,5 +16,5 @@ VOICE_SESSION_SECONDS = int(os.getenv("VOICE_SESSION_SECONDS", "300"))
 MAX_VOICE_SESSIONS = int(os.getenv("MAX_VOICE_SESSIONS", "8"))
 VOICE_CONTEXT_MAX_CHARS = int(os.getenv("VOICE_CONTEXT_MAX_CHARS", "160000"))
 BOT_NAME = os.getenv("BOT_NAME", "HR Support Bot")
-BOT_GREETING = os.getenv("BOT_GREETING", "Hi! Type a question or tap Talk about HR policies in Hindi, Hinglish or English.")
+BOT_GREETING = os.getenv("BOT_GREETING", "Hi! Type a question or tap the mic to talk about HR policies in Hindi, Hinglish or English.")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "https://cg-hr-bot.vercel.app,http://localhost:3000,http://localhost:8000").split(",") if o.strip()]

@@ -112,7 +112,10 @@ def test_voice_rejects_unapproved_origin(client):
             pass
 
 
-def fake_live(monkeypatch):
+def fake_live(monkeypatch, replies=None):
+    answer = types.LiveServerMessage(server_content=types.LiveServerContent(
+        model_turn=types.Content(role='model',parts=[types.Part(inline_data=types.Blob(data=b'\x00\x00'*160, mime_type='audio/pcm;rate=24000'))]),
+        input_transcription=types.Transcription(text='leave policy'), output_transcription=types.Transcription(text='Policy answer'), turn_complete=True))
     class Session:
         def __init__(self):
             self.queue = asyncio.Queue()
@@ -123,9 +126,8 @@ def fake_live(monkeypatch):
         async def send_realtime_input(self, **kwargs):
             if 'audio' in kwargs:
                 self.audio.append(kwargs['audio'].data)
-                await self.queue.put(types.LiveServerMessage(server_content=types.LiveServerContent(
-                    model_turn=types.Content(role='model',parts=[types.Part(inline_data=types.Blob(data=b'\x00\x00'*160, mime_type='audio/pcm;rate=24000'))]),
-                    input_transcription=types.Transcription(text='leave policy'), output_transcription=types.Transcription(text='Policy answer'), turn_complete=True)))
+                for message in replies or [answer]:
+                    await self.queue.put(message)
         async def receive(self):
             yield await self.queue.get()
     session = Session()
@@ -155,6 +157,36 @@ def test_voice_pcm_transcripts_and_cleanup(client,monkeypatch):
     assert session.history[0]['turn_complete'] is False
     assert len(captured['config']['system_instruction']) > 118000
     assert main._voice_connections == 0
+
+
+def test_voice_forwards_speech_start_and_end(client,monkeypatch):
+    activity = lambda kind: types.LiveServerMessage(voice_activity=types.VoiceActivity(voice_activity_type=kind))
+    fake_live(monkeypatch, replies=[activity(types.VoiceActivityType.ACTIVITY_START), activity(types.VoiceActivityType.ACTIVITY_END)])
+    with client.websocket_connect('/api/voice',headers={'origin':config.ALLOWED_ORIGINS[0]}) as ws:
+        ws.send_json({'type':'start'})
+        assert ws.receive_json()['type'] == 'ready'
+        ws.send_json({'type':'audio','data':base64.b64encode(b'\x01\x00'*1600).decode()})
+        assert ws.receive_json() == {'type':'speech','state':'start'}
+        assert ws.receive_json() == {'type':'speech','state':'end'}
+        ws.send_json({'type':'stop'})
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_prompts_follow_the_latest_language_and_voice_is_spoken_style(client,monkeypatch):
+    _, captured = fake_live(monkeypatch)
+    assert "LATEST message" in rag.SYSTEM_PROMPT and 'switch the moment they switch' in rag.SYSTEM_PROMPT
+    with client.websocket_connect('/api/voice',headers={'origin':config.ALLOWED_ORIGINS[0]}) as ws:
+        ws.send_json({'type':'start'})
+        assert ws.receive_json()['type'] == 'ready'
+        ws.send_json({'type':'stop'})
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+    instruction = captured['config']['system_instruction']
+    assert rag.SYSTEM_PROMPT in instruction and rag.VOICE_PROMPT in instruction
+    assert instruction.index('POLICY_CONTEXT:') > instruction.index(rag.VOICE_PROMPT)
+    # Text-only formatting rules (bold, bullets) leak into voice transcripts as literal asterisks.
+    assert 'bold' not in instruction.split('POLICY_CONTEXT:')[0].lower()
 
 
 def test_voice_invalid_frame_closes_without_leaking_details(client,monkeypatch):

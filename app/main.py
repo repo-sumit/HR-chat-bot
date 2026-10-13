@@ -167,10 +167,9 @@ async def voice(ws: WebSocket):
         if initial.get('type') != 'start':
             raise ValueError('Voice session must begin with start')
         prior = ChatRequest(message='voice', history=initial.get('history', [])).history
-        context = rag.voice_context()
         live_config = {
             'response_modalities': ['AUDIO'],
-            'system_instruction': rag.SYSTEM_PROMPT + '\nFor voice, speak naturally in short sentences. Never read formatting symbols aloud.\n\nPOLICY_CONTEXT:\n' + context,
+            'system_instruction': rag.voice_instruction(),
             'input_audio_transcription': {}, 'output_audio_transcription': {},
             'speech_config': {'voice_config': {'prebuilt_voice_config': {'voice_name': config.GEMINI_VOICE}}},
         }
@@ -209,6 +208,10 @@ async def voice(ws: WebSocket):
                 async def outgoing():
                     while True:
                         async for msg in session.receive():
+                            # Speech start/end lets the widget show Listening/Thinking from real signals.
+                            if msg.voice_activity and msg.voice_activity.voice_activity_type:
+                                started = msg.voice_activity.voice_activity_type == types.VoiceActivityType.ACTIVITY_START
+                                await ws.send_json({'type': 'speech', 'state': 'start' if started else 'end'})
                             content = msg.server_content
                             if not content:
                                 continue
