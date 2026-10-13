@@ -1,7 +1,5 @@
 {
-  "buildCommand": "",
-  "outputDirectory": ".",
-  "routes": [
-    { "src": "/", "dest": "/index.html" }
-  ]
+  "buildCommand": "node scripts/build_frontend.js",
+  "outputDirectory": "dist",
+  "rewrites": [{ "source": "/", "destination": "/index.html" }]
 }
